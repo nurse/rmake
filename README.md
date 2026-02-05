@@ -1,0 +1,78 @@
+# rmake
+
+`rmake` is a **make-compatible build runner** implemented in **mruby** with the explicit goal of
+building CRuby across platforms using a single make engine.
+
+This repository is intentionally minimal today: we’re defining the MVP scope and scaffolding a
+clean, testable architecture so we can grow compatibility in a controlled way.
+
+## Goal
+
+- Run enough of CRuby’s Makefiles to build a default CRuby on supported platforms.
+- Prefer compatibility with standard make behavior first, then GNU Make where it matters.
+- Keep the implementation small and testable; native extensions are used only when needed.
+
+## Quick Start (dev)
+
+This is a mruby gem-style layout.
+
+- `mrbgem.rake` defines the gem.
+- `mrblib/` contains the mruby sources.
+- `tools/rmake` is the CLI entrypoint (invoked via `mruby tools/rmake`).
+
+### Build mruby
+
+`rmake` ships a local mruby build under `mruby/` and includes `mruby-file-stat` for fast `File.mtime`.
+
+```sh
+cd mruby
+make clean all
+```
+
+### Run
+
+```sh
+/path/to/mruby/bin/mruby tools/rmake [options] [target] [VAR=VALUE]
+```
+
+Options:
+
+- `-f FILE` Read FILE as a makefile
+- `-j N`    Run N jobs in parallel
+- `-n`      Dry-run (print commands without running)
+- `-d`      Trace target evaluation and skips
+
+## Status
+
+- Parser/evaluator/executor are in `mrblib/` with a growing test suite.
+- Standard make compatibility is the current focus before GNU make extensions.
+
+## Supported (today)
+
+- Variable assignments: `=`, `:=`, `+=`
+- Conditionals: `ifeq`, `ifneq`, `else ifeq`, `else ifneq`, `else`, `endif`
+- Includes: `include`, `-include`, `!include`
+- Targets and recipes, order-only prerequisites (`|`)
+- Suffix rules like `.c.o:`
+- `.PHONY`, `.PRECIOUS`, `.DELETE_ON_ERROR`
+- VPATH search for prerequisites
+- `-j` parallel builds (when `Process.spawn` is available)
+- `-n` dry-run prints commands (even for `@` lines, like GNU make)
+- `-d` trace mode for debugging
+
+## Not Yet Supported
+
+- GNU make functions like `$(if ...)`, `$(or ...)`, `$(and ...)`, `$(filter ...)`, `$(eval ...)`, `$(call ...)`
+- Pattern rules (`%`) and advanced automatic variables
+- `.ONESHELL`, `.SECONDEXPANSION`, and other GNU make extensions
+
+## Tests
+
+```sh
+ruby test/run.rb
+```
+
+## Next
+
+- Tighten standard make compatibility and fixture coverage
+- Implement minimal GNU make functions required by CRuby build

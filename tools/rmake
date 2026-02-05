@@ -1,0 +1,29 @@
+#!/usr/bin/env mruby
+
+$LOAD_PATH ||= []
+$LOAD_PATH.unshift(File.expand_path("../mrblib", File.dirname(__FILE__)))
+$rmake_mruby = File.expand_path("../mruby/bin/mruby", File.dirname(__FILE__))
+
+if Kernel.respond_to?(:require)
+  require 'rmake'
+else
+  base = File.expand_path("../mrblib", File.dirname(__FILE__))
+  [
+    "rmake/compat.rb",
+    "rmake/util.rb",
+    "rmake/parser.rb",
+    "rmake/evaluator.rb",
+    "rmake/graph.rb",
+    "rmake/executor.rb",
+    "rmake/shell.rb",
+    "rmake/cli.rb",
+  ].each do |path|
+    code = File.read(File.join(base, path))
+    eval(code)
+  end
+end
+
+status = RMake::CLI.run(ARGV)
+if Kernel.respond_to?(:exit)
+  exit status
+end

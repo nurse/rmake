@@ -1,0 +1,8 @@
+.DS_Store
+
+# mruby build artifacts
+mruby/build/
+mruby/bin/
+
+# rmake temporary files
+*.tmp
