@@ -174,6 +174,30 @@ end
 
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
+    Dir.chdir(dir) do
+      dep = "dep.txt"
+      tgt = "tgt.txt"
+      File.write(dep, "a")
+      File.write(tgt, "b")
+      File.utime(Time.now, Time.now + 10, dep)
+      File.utime(Time.now, Time.now, tgt)
+
+      g = RMake::Graph.new
+      rule = RMake::Evaluator::Rule.new([tgt], [dep], [], ["echo RUN"], false)
+      g.add_rule(rule, phony: false, precious: false)
+      shell = RMake::Shell.new(true)
+      exec = RMake::Executor.new(g, shell, {})
+      node = g.node(tgt)
+
+      assert("dep newer triggers rebuild", exec.send(:need_build?, node))
+      exec.instance_variable_get(:@restat_no_change)[dep] = true
+      assert("restat skips dep", !exec.send(:need_build?, node))
+    end
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
     File.write(File.join(dir, "Makefile"), <<~MK)
 foo.bar:
 \techo $(*F) $(*D)
@@ -340,6 +364,42 @@ all:
       end
     end
     assert("default jobs from RMAKE_JOBS", out.include?("-j3"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all:
+\techo $(MFLAGS)
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        with_env("MAKEFLAGS", "-j5") do
+          with_env("RMAKE_JOBS", "") do
+            RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+          end
+        end
+      end
+    end
+    assert("default jobs from MAKEFLAGS", out.include?("-j5"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all:
+\techo $(MFLAGS)
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        with_env("RMAKE_JOBS", "4") do
+          RMake::CLI.run(["-f", "Makefile", "-n", "-j", "all"])
+        end
+      end
+    end
+    assert("default jobs when -j has no value", out.include?("-j4"))
   end
 end
 

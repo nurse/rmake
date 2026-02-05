@@ -21,8 +21,20 @@ module RMake
           i += 1
           opts[:makefile] = argv[i]
         elsif arg == "-j"
-          i += 1
-          opts[:jobs] = argv[i].to_i
+          next_arg = argv[i + 1]
+          if next_arg && next_arg.match?(/\A\d+\z/)
+            i += 1
+            n = argv[i].to_i
+            if n <= 0
+              detected = default_jobs
+              opts[:jobs] = detected if detected && detected > 0
+            else
+              opts[:jobs] = n
+            end
+          else
+            detected = default_jobs
+            opts[:jobs] = detected if detected && detected > 0
+          end
           jobs_set = true
         elsif arg == "-n"
           opts[:dry_run] = true
@@ -34,7 +46,13 @@ module RMake
             opts[:vars][k] = v || ""
           end
         elsif arg.start_with?("-j") && arg.length > 2
-          opts[:jobs] = arg[2..-1].to_i
+          n = arg[2..-1].to_i
+          if n <= 0
+            detected = default_jobs
+            opts[:jobs] = detected if detected && detected > 0
+          else
+            opts[:jobs] = n
+          end
           jobs_set = true
         else
           opts[:target] = arg
@@ -238,13 +256,51 @@ module RMake
           n = env.to_i
           return n if n > 0
         end
+        flags = ENV["MAKEFLAGS"]
+        n = jobs_from_flags(flags)
+        if n
+          return n if n > 0
+          detected = detect_cpu_jobs
+          return detected if detected && detected > 0
+        end
+        flags = ENV["MFLAGS"]
+        n = jobs_from_flags(flags)
+        if n
+          return n if n > 0
+          detected = detect_cpu_jobs
+          return detected if detected && detected > 0
+        end
       end
+      detect_cpu_jobs
+    end
+
+    def self.detect_cpu_jobs
       n = Util.shell_capture("getconf _NPROCESSORS_ONLN")
       n = n.to_i if n
       return n if n && n > 0
       n = Util.shell_capture("sysctl -n hw.ncpu")
       n = n.to_i if n
       return n if n && n > 0
+      nil
+    end
+
+    def self.jobs_from_flags(flags)
+      return nil unless flags && !flags.empty?
+      parts = Util.split_ws(flags)
+      i = 0
+      while i < parts.length
+        part = parts[i]
+        if part == "-j" || part == "--jobs"
+          i += 1
+          return 0 if i >= parts.length
+          return parts[i].to_i
+        elsif part.start_with?("-j") && part.length > 2
+          return part[2..-1].to_i
+        elsif part.start_with?("--jobs=")
+          return part.split("=", 2)[1].to_i
+        end
+        i += 1
+      end
       nil
     end
 

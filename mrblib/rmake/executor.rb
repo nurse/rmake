@@ -191,8 +191,11 @@ module RMake
       tgt_mtime = mtime(node.name)
       return true if tgt_mtime.nil?
 
-      deps = node.deps.map { |d| resolve_path(d) }.compact
-      deps.any? { |p| (mtime(p) || 0) > tgt_mtime }
+      node.deps.any? do |dep|
+        next false if @restat_no_change[dep]
+        path = resolve_path(dep) || dep
+        (mtime(path) || 0) > tgt_mtime
+      end
     end
 
     def run_recipe(node)
@@ -390,11 +393,25 @@ module RMake
 
     def restat_update(name, old_mtime)
       @mtime_cache.delete(name)
+      if name.start_with?("./")
+        @mtime_cache.delete(name[2..-1])
+      else
+        @mtime_cache.delete("./#{name}")
+      end
       new_mtime = mtime(name)
       if old_mtime && new_mtime && old_mtime == new_mtime
         @restat_no_change[name] = true
+        if name.start_with?("./")
+          @restat_no_change[name[2..-1]] = true
+        else
+          @restat_no_change["./#{name}"] = true
+        end
       else
         @restat_no_change.delete(name)
+        @restat_no_change.delete("./#{name}")
+        if name.start_with?("./")
+          @restat_no_change.delete(name[2..-1])
+        end
       end
     end
   end
