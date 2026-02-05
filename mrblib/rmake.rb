@@ -1,7 +1,6 @@
 module RMake
 end
 
-require_relative 'rmake/compat'
 require_relative 'rmake/util'
 require_relative 'rmake/parser'
 require_relative 'rmake/evaluator'

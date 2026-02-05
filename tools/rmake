@@ -9,7 +9,6 @@ if Kernel.respond_to?(:require)
 else
   base = File.expand_path("../mrblib", File.dirname(__FILE__))
   [
-    "rmake/compat.rb",
     "rmake/util.rb",
     "rmake/parser.rb",
     "rmake/evaluator.rb",

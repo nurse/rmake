@@ -23,6 +23,7 @@ This is a mruby gem-style layout.
 ### Build mruby
 
 `rmake` ships a local mruby build under `mruby/` and includes `mruby-file-stat` for fast `File.mtime`.
+`File.mtime` support is required.
 
 ```sh
 cd mruby
