@@ -12,6 +12,7 @@ module RMake
       @node_cache = {}
       @vpath_dirs = nil
       @built_any = false
+      @restat_no_change = {}
     end
 
     def built_any?
@@ -35,12 +36,14 @@ module RMake
       node.order_only.each { |dep| return false unless build(dep, node.name) }
 
       if need_build?(node)
+        old_mtime = mtime(node.name)
         @built_any = true
         ok = run_recipe(node)
         unless ok
           cleanup_target(node)
           return false
         end
+        restat_update(node.name, old_mtime)
       else
         puts "rmake: #{node.name} (skip)" if @trace
       end
@@ -61,6 +64,7 @@ module RMake
       ready = []
       done = {}
       running = {}
+      run_old = {}
 
       plan.each do |name, node|
         deps = node.deps + node.order_only
@@ -85,6 +89,7 @@ module RMake
 
           puts "rmake: #{node.name}" if @trace
           @built_any = true
+          run_old[node.name] = mtime(node.name)
           pid = @shell.spawn_recipe(node, @vars, auto_vars(node))
           if pid == 0
             mark_done(node.name, done, pending, reverse, plan, ready)
@@ -100,6 +105,7 @@ module RMake
             cleanup_target(node)
             return false
           end
+          restat_update(node.name, run_old[node.name])
           mark_done(node.name, done, pending, reverse, plan, ready)
         end
 
@@ -201,12 +207,17 @@ module RMake
     def auto_vars(node)
       prereqs = node.deps.map { |d| resolve_path(d) || d }
       first = prereqs.first || ""
+      stem = Util.strip_suffix(node.name)
+      stem_dir = File.dirname(stem)
+      stem_dir = "." if stem_dir == "."
       {
         "@" => node.name,
         "<" => first,
         "?" => prereqs.join(" "),
         "^" => prereqs.join(" "),
-        "*" => Util.strip_suffix(node.name),
+        "*" => stem,
+        "*F" => File.basename(stem),
+        "*D" => stem_dir,
         "@F" => File.basename(node.name),
         "@D" => File.dirname(node.name) == "." ? "." : File.dirname(node.name),
       }
@@ -218,7 +229,21 @@ module RMake
       end
       if File.exist?(path)
         @resolve_cache[path] = path
+        if path.start_with?("./")
+          @resolve_cache[path[2..-1]] = path
+        else
+          @resolve_cache["./#{path}"] = path
+        end
         return path
+      end
+      if path.start_with?("/") || path.start_with?("./") || path.start_with?("../")
+        @resolve_cache[path] = nil
+        if path.start_with?("./")
+          @resolve_cache[path[2..-1]] = nil
+        else
+          @resolve_cache["./#{path}"] = nil
+        end
+        return nil
       end
       dirs = vpath_dirs
       if dirs.nil? || dirs.empty?
@@ -246,6 +271,14 @@ module RMake
         "rmake: *** No rule to make target `#{target}', needed by `#{parent}'. Stop."
       else
         "rmake: *** No rule to make target `#{target}'. Stop."
+      end
+      if Object.const_defined?(:ENV) && ENV["RMAKE_DEBUG_MISSING"]
+        extra = "rmake: debug missing target=#{target.inspect} parent=#{parent.inspect}"
+        if Kernel.respond_to?(:warn)
+          warn extra
+        else
+          puts extra
+        end
       end
       if Kernel.respond_to?(:warn)
         warn msg
@@ -352,6 +385,16 @@ module RMake
         next unless pending[dep_name] == 0
         node = plan[dep_name]
         ready << node if node
+      end
+    end
+
+    def restat_update(name, old_mtime)
+      @mtime_cache.delete(name)
+      new_mtime = mtime(name)
+      if old_mtime && new_mtime && old_mtime == new_mtime
+        @restat_no_change[name] = true
+      else
+        @restat_no_change.delete(name)
       end
     end
   end

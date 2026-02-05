@@ -174,6 +174,22 @@ end
 
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+foo.bar:
+\techo $(*F) $(*D)
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "foo.bar"])
+      end
+    end
+    assert("*F expands basename", out.include?("foo"))
+    assert("*D expands dir", out.include?(".")) 
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
     File.write(File.join(dir, "Makefile"), "all:\n")
     File.write(File.join(dir, "all"), "")
     out, _err = capture_io do
@@ -307,6 +323,23 @@ all:
       end
     end
     assert("no phony dep keeps up-to-date", !out.include?("echo RUN"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all:
+\techo $(MFLAGS)
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        with_env("RMAKE_JOBS", "3") do
+          RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+        end
+      end
+    end
+    assert("default jobs from RMAKE_JOBS", out.include?("-j3"))
   end
 end
 

@@ -10,6 +10,7 @@ module RMake
         trace: false,
         help: false,
       }
+      jobs_set = false
 
       i = 0
       while i < argv.length
@@ -22,6 +23,7 @@ module RMake
         elsif arg == "-j"
           i += 1
           opts[:jobs] = argv[i].to_i
+          jobs_set = true
         elsif arg == "-n"
           opts[:dry_run] = true
         elsif arg == "-d" || arg == "--trace"
@@ -33,10 +35,16 @@ module RMake
           end
         elsif arg.start_with?("-j") && arg.length > 2
           opts[:jobs] = arg[2..-1].to_i
+          jobs_set = true
         else
           opts[:target] = arg
         end
         i += 1
+      end
+
+      if !jobs_set
+        detected = default_jobs
+        opts[:jobs] = detected if detected && detected > 0
       end
 
       if opts[:help]
@@ -221,6 +229,23 @@ module RMake
       puts "Notes:"
       puts "  - Command echo follows make behavior (use V=1 to show)"
       puts "  - Variables can be set as VAR=VALUE on the command line"
+    end
+
+    def self.default_jobs
+      if Object.const_defined?(:ENV)
+        env = ENV["RMAKE_JOBS"]
+        if env && !env.empty?
+          n = env.to_i
+          return n if n > 0
+        end
+      end
+      n = Util.shell_capture("getconf _NPROCESSORS_ONLN")
+      n = n.to_i if n
+      return n if n && n > 0
+      n = Util.shell_capture("sysctl -n hw.ncpu")
+      n = n.to_i if n
+      return n if n && n > 0
+      nil
     end
 
     def self.default_target(explicit, evalr, graph)
