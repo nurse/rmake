@@ -310,6 +310,22 @@ all:
   end
 end
 
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all: src.txt
+\techo OK
+    MK
+    File.write(File.join(dir, "src.txt"), "x")
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "-j2", "all"])
+      end
+    end
+    assert("parallel scheduler ignores file deps", out.include?("echo OK"))
+  end
+end
+
 failures = []
 tests.each_with_index do |t, i|
   begin

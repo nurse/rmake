@@ -56,28 +56,41 @@ module RMake
       plan = collect_targets(target)
       return true if plan.empty?
 
+      reverse = {}
+      pending = {}
+      ready = []
       done = {}
       running = {}
-      ready = []
 
       plan.each do |name, node|
-        if node.deps.empty? && node.order_only.empty?
-          ready << node
+        deps = node.deps + node.order_only
+        wait_deps = deps.select { |dep| plan.key?(dep) }
+        pending[name] = wait_deps.length
+        wait_deps.each do |dep|
+          (reverse[dep] ||= []) << name
         end
+      end
+
+      plan.each_key do |name|
+        ready << plan[name] if pending[name] == 0
       end
 
       while done.length < plan.length
         while ready.any? && running.length < jobs
           node = ready.shift
           if !need_build?(node)
-            done[node.name] = true
+            mark_done(node.name, done, pending, reverse, plan, ready)
             next
           end
 
           puts "rmake: #{node.name}" if @trace
           @built_any = true
           pid = @shell.spawn_recipe(node, @vars, auto_vars(node))
-          running[pid] = node
+          if pid == 0
+            mark_done(node.name, done, pending, reverse, plan, ready)
+          else
+            running[pid] = node
+          end
         end
 
         if running.any?
@@ -87,17 +100,9 @@ module RMake
             cleanup_target(node)
             return false
           end
-          done[node.name] = true
+          mark_done(node.name, done, pending, reverse, plan, ready)
         end
 
-        # refresh ready list based on newly completed nodes
-        plan.each do |name, node|
-          next if done[name] || running.value?(node) || ready.include?(node)
-          deps_done = (node.deps + node.order_only).all? { |d| done[d] || !plan.key?(d) }
-          ready << node if deps_done
-        end
-
-        # if nothing is running and nothing is ready, we're done
         break if running.empty? && ready.empty?
       end
 
@@ -334,6 +339,20 @@ module RMake
         end
       end
       plan
+    end
+
+    def mark_done(name, done, pending, reverse, plan, ready)
+      return if done[name]
+      done[name] = true
+      deps = reverse[name]
+      return unless deps
+      deps.each do |dep_name|
+        next if done[dep_name]
+        pending[dep_name] -= 1
+        next unless pending[dep_name] == 0
+        node = plan[dep_name]
+        ready << node if node
+      end
     end
   end
 end
