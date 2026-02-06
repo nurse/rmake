@@ -71,18 +71,10 @@ module RMake
     end
 
     def self.eval_token(token, vars, ctx)
-      if token.start_with?("strip ")
-        arg = token[6..-1].to_s
-        return strip_ws(expand(arg, vars, ctx))
-      elsif token.start_with?("findstring ")
-        arg = token[11..-1].to_s
-        a, b = split_func_args(arg)
-        a = expand(a.to_s, vars, ctx)
-        b = expand(b.to_s, vars, ctx)
-        return b.include?(a) ? a : ""
-      elsif token.start_with?("shell ")
-        cmd = expand(token[6..-1].to_s, vars, ctx)
-        return shell_capture(cmd)
+      func, func_args = split_func_name(token)
+      if func
+        res = eval_func(func, func_args, vars, ctx)
+        return res unless res.nil?
       end
 
       name = token
@@ -158,6 +150,202 @@ module RMake
       [str.to_s, ""]
     end
 
+    def self.split_func_args_all(str)
+      return [] if str.nil?
+      out = []
+      cur = ""
+      i = 0
+      depth = 0
+      closer = nil
+      while i < str.length
+        c = str[i]
+        if c == "$" && (str[i + 1] == "(" || str[i + 1] == "{")
+          depth += 1
+          closer = str[i + 1] == "(" ? ")" : "}"
+          cur << c
+          i += 1
+          cur << str[i]
+          i += 1
+          next
+        end
+        if depth > 0 && c == closer
+          depth -= 1
+          cur << c
+          i += 1
+          next
+        end
+        if depth == 0 && c == ","
+          out << cur
+          cur = ""
+          i += 1
+          next
+        end
+        cur << c
+        i += 1
+      end
+      out << cur
+      out
+    end
+
+    def self.split_func_name(token)
+      return nil unless token
+      t = token.lstrip
+      idx_space = t.index(" ")
+      idx_comma = t.index(",")
+      idx = [idx_space, idx_comma].compact.min
+      return nil unless idx
+      func = t[0...idx]
+      args = t[(idx + 1)..-1].to_s
+      return nil if func.empty?
+      [func, args]
+    end
+
+    def self.eval_func(func, args, vars, ctx)
+      case func
+      when "strip"
+        arg = expand(args.to_s, vars, ctx)
+        return strip_ws(arg)
+      when "findstring"
+        a, b = split_func_args(args)
+        a = expand(a.to_s, vars, ctx)
+        b = expand(b.to_s, vars, ctx)
+        return b.include?(a) ? a : ""
+      when "shell"
+        cmd = expand(args.to_s, vars, ctx)
+        return shell_capture(cmd)
+      when "if"
+        a, b, c = split_func_args_all(args)
+        cond = expand(a.to_s, vars, ctx)
+        return cond.to_s.empty? ? expand(c.to_s, vars, ctx) : expand(b.to_s, vars, ctx)
+      when "filter"
+        a, b = split_func_args(args)
+        patterns = split_ws(expand(a.to_s, vars, ctx))
+        words = split_ws(expand(b.to_s, vars, ctx))
+        matched = words.select { |w| patterns.any? { |p| match_pattern(w, p) } }
+        return matched.join(" ")
+      when "filter-out"
+        a, b = split_func_args(args)
+        patterns = split_ws(expand(a.to_s, vars, ctx))
+        words = split_ws(expand(b.to_s, vars, ctx))
+        matched = words.reject { |w| patterns.any? { |p| match_pattern(w, p) } }
+        return matched.join(" ")
+      when "subst"
+        a, b = split_func_args(args)
+        from = expand(a.to_s, vars, ctx)
+        to, text = split_func_args(b)
+        to = expand(to.to_s, vars, ctx)
+        text = expand(text.to_s, vars, ctx)
+        return text.to_s.gsub(from.to_s, to.to_s)
+      when "patsubst"
+        a, b = split_func_args(args)
+        from = expand(a.to_s, vars, ctx)
+        to, text = split_func_args(b)
+        to = expand(to.to_s, vars, ctx)
+        text = expand(text.to_s, vars, ctx)
+        words = split_ws(text)
+        words = words.map do |w|
+          repl = apply_percent_subst(w, from, to)
+          repl ? repl : w
+        end
+        return words.join(" ")
+      when "addprefix"
+        a, b = split_func_args(args)
+        prefix = expand(a.to_s, vars, ctx)
+        words = split_ws(expand(b.to_s, vars, ctx))
+        return words.map { |w| prefix + w }.join(" ")
+      when "addsuffix"
+        a, b = split_func_args(args)
+        suffix = expand(a.to_s, vars, ctx)
+        words = split_ws(expand(b.to_s, vars, ctx))
+        return words.map { |w| w + suffix }.join(" ")
+      when "firstword"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words[0] || ""
+      when "word"
+        a, b = split_func_args(args)
+        idx = expand(a.to_s, vars, ctx).to_i
+        words = split_ws(expand(b.to_s, vars, ctx))
+        return idx <= 0 ? "" : (words[idx - 1] || "")
+      when "wildcard"
+        patterns = split_ws(expand(args.to_s, vars, ctx))
+        matches = []
+        if Object.const_defined?(:Dir) && Dir.respond_to?(:glob)
+          patterns.each { |pat| matches.concat(Dir.glob(pat)) }
+          return matches.join(" ")
+        end
+        # Fallback to shell expansion when Dir.glob is unavailable (mruby).
+        patterns.each do |pat|
+          if pat.include?("*") || pat.include?("?") || pat.include?("[")
+            out = shell_capture("ls -1 #{pat} 2>/dev/null")
+            matches.concat(split_ws(out))
+          elsif File.exist?(pat)
+            matches << pat
+          end
+        end
+        return matches.join(" ")
+      when "notdir"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.map { |w| File.basename(w) }.join(" ")
+      when "dir"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.map { |w| normalize_dir(w) }.join(" ")
+      when "value"
+        name = expand(args.to_s, vars, ctx)
+        var = vars[name]
+        return var ? var.value.to_s : ""
+      when "call"
+        parts = split_func_args_all(args)
+        name = expand(parts.shift.to_s, vars, ctx)
+        var = vars[name]
+        body = var ? var.value.to_s : ""
+        ctx2 = ctx.dup
+        parts.each_with_index do |arg, i|
+          ctx2[(i + 1).to_s] = expand(arg.to_s, vars, ctx)
+        end
+        return expand(body, vars, ctx2)
+      when "foreach"
+        a, b = split_func_args(args)
+        var_name = expand(a.to_s, vars, ctx)
+        list, text = split_func_args(b)
+        words = split_ws(expand(list.to_s, vars, ctx))
+        out = []
+        words.each do |w|
+          ctx2 = ctx.dup
+          ctx2[var_name] = w
+          out << expand(text.to_s, vars, ctx2)
+        end
+        return out.join(" ")
+      when "eval"
+        eval_body = expand(args.to_s, vars, ctx)
+        evaluator = ctx["__evaluator"]
+        if evaluator && evaluator.respond_to?(:eval_text, true)
+          evaluator.send(:eval_text, eval_body.to_s)
+        end
+        return ""
+      end
+      nil
+    end
+
+    def self.match_pattern(word, pattern)
+      return false if pattern.nil?
+      if pattern.include?("%")
+        parts = pattern.split("%", 2)
+        pre = parts[0]
+        post = parts[1] || ""
+        return word.start_with?(pre) && word.end_with?(post)
+      end
+      word == pattern
+    end
+
+    def self.normalize_dir(word)
+      return "./" if word.nil? || word.empty?
+      d = File.dirname(word)
+      d = "." if d.nil? || d.empty?
+      d = "./" if d == "."
+      d = "#{d}/" unless d.end_with?("/")
+      d
+    end
+
     def self.strip_ws(str)
       return "" if str.nil?
       split_ws(str).join(" ")
@@ -182,18 +370,31 @@ module RMake
         rescue
           return ""
         end
-        return out.strip
+        out = out.to_s
+        return normalize_shell_output(out)
       end
       if IO.respond_to?(:popen)
         out = ""
         begin
           IO.popen("/bin/sh -c #{shell_escape(cmd)}") { |io| out = io.read.to_s }
-          return out.strip
+          out = out.to_s
+          return normalize_shell_output(out)
         rescue
           return ""
         end
       end
       ""
+    end
+
+    def self.normalize_shell_output(out)
+      return "" if out.nil?
+      s = out.to_s
+      if s.end_with?("\r\n")
+        s = s[0...-2]
+      elsif s.end_with?("\n")
+        s = s[0...-1]
+      end
+      s.tr("\n", " ")
     end
 
     def self.strip_leading_ws(str)
@@ -223,6 +424,7 @@ module RMake
     def self.strip_cmd_prefixes(str)
       silent = false
       ignore = false
+      force = false
       cmd = str
       loop do
         changed = false
@@ -238,9 +440,15 @@ module RMake
           cmd = cmd2
           changed = true
         end
+        flag, cmd2 = strip_cmd_prefix(cmd, "+")
+        if flag
+          force = true
+          cmd = cmd2
+          changed = true
+        end
         break unless changed
       end
-      [silent, ignore, cmd]
+      [silent, ignore, force, cmd]
     end
 
     def self.strip_prefix(str, ch)
@@ -255,6 +463,16 @@ module RMake
       idx = name.rindex(".")
       return name if idx.nil?
       name[0...idx]
+    end
+
+    def self.filter_prereq_words(words)
+      out = []
+      words.each do |w|
+        next if w == "export" || w == "override"
+        next if w.include?("=")
+        out << w
+      end
+      out
     end
 
     def self.normalize_brace_path(token)
@@ -277,6 +495,12 @@ module RMake
         return candidate if File.exist?(candidate)
       end
       rest
+    end
+
+    def self.normalize_path(token)
+      return token unless token.start_with?("./")
+      rest = token[2..-1].to_s
+      rest.empty? ? "." : rest
     end
 
     def self.apply_percent_subst(word, from, to)

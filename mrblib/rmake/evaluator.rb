@@ -1,19 +1,38 @@
 module RMake
+  unless Object.const_defined?(:StringIO)
+    class StringIO
+      def initialize(str)
+        @str = str.to_s
+      end
+
+      def each_line
+        return enum_for(:each_line) unless block_given?
+        @str.split("\n", -1).each do |line|
+          yield line
+        end
+      end
+    end
+  end
+
   class Evaluator
     Rule = Struct.new(:targets, :prereqs, :order_only, :recipe, :double_colon)
 
-    attr_reader :rules, :vars
+    attr_reader :rules, :vars, :target_vars
+    attr_reader :includes, :missing_required
 
     def initialize(lines)
       @lines = lines
       @rules = []
       @vars = {}
       @overrides = {}
+      @includes = []
+      @missing_required = []
       @suffix_rules = []
       @suffixes = []
       @delete_on_error = false
       @precious = {}
       @phony = {}
+      @target_vars = {}
       @cond_stack = []
       seed_env
     end
@@ -34,15 +53,29 @@ module RMake
 
         if line.recipe
           if current_rule
-            current_rule.recipe << Util.strip_leading_ws(line.raw)
+            recipe = Util.strip_leading_ws(line.raw)
+            current_rule.recipe << recipe
           end
           next
         end
 
-        # Variable assignment
+        # Variable assignment (+ export / override)
+        force_override = false
+        export_only = false
+        if s.start_with?("override ")
+          force_override = true
+          s = s[9..-1].to_s.lstrip
+        end
+        if s.start_with?("export ")
+          export_only = true
+          s = s[7..-1].to_s.lstrip
+        end
         if (assign = parse_assignment(s))
           name, op, value = assign
-          assign_var(name, op, value)
+          assign_var(name, op, value, force_override)
+          next
+        elsif export_only
+          # "export VAR" without assignment: ignore for now.
           next
         end
 
@@ -51,6 +84,7 @@ module RMake
           optional, arg = inc
           files = Util.split_ws(expand(arg))
           files.each do |f|
+            @includes << [f, optional]
             include_file(f, optional)
           end
           next
@@ -79,14 +113,25 @@ module RMake
 
         # Rules
         if (rule = parse_rule(s))
-          targets_str, sep, prereq_part = rule
+          targets_str, sep, prereq_part_raw = rule
+          inline = nil
+          if (sc = find_top_level_char(prereq_part_raw.to_s, ";"))
+            inline = prereq_part_raw[(sc + 1)..-1].to_s
+            prereq_part_raw = prereq_part_raw[0...sc].to_s
+          end
+          assign = parse_assignment(prereq_part_raw.to_s.strip)
+          if assign && (inline.nil? || inline.strip.empty?)
+            targets = Util.split_ws(expand(targets_str)).reject(&:empty?)
+            targets = targets.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }
+            targets.each { |t| assign_target_var(t, assign[0], assign[1], assign[2]) }
+            next
+          end
           targets = Util.split_ws(expand(targets_str)).reject(&:empty?)
-          targets = targets.map { |t| Util.normalize_brace_path(t) }
-          prereq_part_raw = prereq_part
-          prereq_part = expand(prereq_part)
+          targets = targets.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }
+          prereq_part = expand(prereq_part_raw)
           normal, order_only = prereq_part.split("|", 2).map { |x| x ? x.strip : "" }
-          prereqs = Util.split_ws(normal.to_s).reject(&:empty?).map { |t| Util.normalize_brace_path(t) }
-          order_only = Util.split_ws(order_only.to_s).reject(&:empty?).map { |t| Util.normalize_brace_path(t) }
+          prereqs = Util.filter_prereq_words(Util.split_ws(normal.to_s).reject(&:empty?)).map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
+          order_only = Util.filter_prereq_words(Util.split_ws(order_only.to_s).reject(&:empty?)).map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
           current_rule = Rule.new(targets, prereqs, order_only, [], sep == "::")
 
           # Suffix rules like .c.o:
@@ -96,7 +141,16 @@ module RMake
           else
             @rules << current_rule
           end
+          if inline && !inline.strip.empty?
+            recipe = Util.strip_leading_ws(inline)
+            current_rule.recipe << recipe
+          end
           next
+        end
+
+        # Expand standalone function calls (e.g., $(eval ...))
+        if s.include?("$")
+          expand(s)
         end
       end
 
@@ -138,10 +192,17 @@ module RMake
       ev.phony_list.each { |t| @phony[t] = true }
       ev.precious_list.each { |t| @precious[t] = true }
       @delete_on_error ||= ev.delete_on_error?
+      @includes.concat(ev.includes) if ev.respond_to?(:includes)
+      @missing_required.concat(ev.missing_required) if ev.respond_to?(:missing_required)
       ev.instance_variable_get(:@overrides).each_key do |k|
         @overrides[k] = true
       end
       @vars.merge!(ev.vars)
+      if ev.respond_to?(:target_vars)
+        ev.target_vars.each do |t, vars|
+          (@target_vars[t] ||= {}).merge!(vars)
+        end
+      end
     end
 
     private
@@ -151,16 +212,18 @@ module RMake
       if Object.const_defined?(:ENV)
         @vars["MAKE"] = Var.simple(ENV["MAKE"] || "make")
         @vars["MFLAGS"] = Var.simple(ENV["MFLAGS"] || "")
+        @vars["mflags"] = Var.simple(@vars["MFLAGS"].value)
         @vars["MAKECMDGOALS"] = Var.simple(ENV["MAKECMDGOALS"] || "")
       else
         @vars["MAKE"] = Var.simple("make")
         @vars["MFLAGS"] = Var.simple("")
+        @vars["mflags"] = Var.simple("")
         @vars["MAKECMDGOALS"] = Var.simple("")
       end
     end
 
-    def assign_var(name, op, value)
-      return if @overrides[name]
+    def assign_var(name, op, value, force_override = false)
+      return if @overrides[name] && !force_override
       case op
       when "="
         @vars[name] = Var.recursive(value)
@@ -182,6 +245,29 @@ module RMake
       end
     end
 
+    def assign_target_var(target, name, op, value)
+      tvars = (@target_vars[target] ||= {})
+      case op
+      when "="
+        tvars[name] = Var.recursive(value)
+      when ":="
+        tvars[name] = Var.simple(expand(value))
+      when "+="
+        prev = tvars[name] || @vars[name]
+        if prev
+          if prev.simple
+            tvars[name] = Var.simple(prev.value + " " + expand(value))
+          else
+            tvars[name] = Var.recursive(prev.value + " " + value)
+          end
+        else
+          tvars[name] = Var.recursive(value)
+        end
+      else
+        tvars[name] = Var.recursive(value)
+      end
+    end
+
     def include_file(path, optional = false)
       return if path.nil? || path.empty?
       begin
@@ -189,16 +275,32 @@ module RMake
           extra = Parser.new(io, path).parse
           Evaluator.new(extra).tap do |ev|
             ev.vars.merge!(@vars)
+            ev.instance_variable_get(:@overrides).merge!(@overrides)
             ev.evaluate
             merge!(ev)
           end
         end
       rescue Errno::ENOENT
-        raise unless optional
+        @missing_required << path unless optional
+        return
+      end
+    end
+
+    def eval_text(text)
+      return if text.nil? || text.empty?
+      io = StringIO.new(text)
+      extra = Parser.new(io, "<eval>").parse
+      Evaluator.new(extra).tap do |ev|
+        ev.vars.merge!(@vars)
+        ev.instance_variable_get(:@overrides).merge!(@overrides)
+        ev.evaluate
+        merge!(ev)
       end
     end
 
     def expand(str, ctx = {})
+      ctx = ctx ? ctx.dup : {}
+      ctx["__evaluator"] = self
       Util.expand(str, @vars, ctx)
     end
 

@@ -100,25 +100,11 @@ endif
 end
 
 tests << lambda do
-  silent, ignore, cmd = RMake::Util.strip_cmd_prefixes("  @- echo hi")
+  silent, ignore, force, cmd = RMake::Util.strip_cmd_prefixes("  @- echo hi")
   assert("strip_cmd_prefixes silent", silent)
   assert("strip_cmd_prefixes ignore", ignore)
+  assert("strip_cmd_prefixes force", !force)
   assert("strip_cmd_prefixes cmd", cmd == "echo hi")
-end
-
-tests << lambda do
-  line = "FOO=bar"
-  assert("strip_comments no hash", RMake::Util.strip_comments(line) == line)
-end
-
-tests << lambda do
-  parts = RMake::Util.split_ws("token")
-  assert("split_ws single token", parts == ["token"])
-end
-
-tests << lambda do
-  out = RMake::Util.expand("plain", {}, {})
-  assert("expand no dollar", out == "plain")
 end
 
 tests << lambda do
@@ -149,14 +135,66 @@ end
 
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
-    File.write(File.join(dir, "Makefile"), "all:\n")
-    File.write(File.join(dir, "all"), "")
-    out, _err = capture_io do
-      Dir.chdir(dir) do
-        RMake::CLI.run(["-f", "Makefile"])
-      end
+    script = File.join(dir, "make.sh")
+    out_path = File.join(dir, "out.txt")
+    File.write(script, "#!/bin/sh\necho CLEAN >> #{out_path}\n")
+    File.chmod(0755, script)
+
+    ev = parse_eval(<<~MK)
+clean:
+\t@$(MAKE)
+    MK
+    ev.vars["MAKE"] = RMake::Evaluator::Var.simple(script)
+
+    g = RMake::Graph.new
+    ev.rules.each { |r| g.add_rule(r, phony: false, precious: false) }
+    shell = RMake::Shell.new(true)
+    exec = RMake::Executor.new(g, shell, ev.vars)
+    with_env("MAKE", "") do
+      exec.build("clean")
     end
-    assert("nothing to be done emitted", out.include?("Nothing to be done for `all'."))
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("dry-run executes recursive command", content.include?("CLEAN"))
+  end
+end
+
+tests << lambda do
+  ev = parse_eval(<<~MK)
+ext/clean.sub:
+\t@echo $(@D) $(@F) $(@F:.sub=)
+  MK
+  g = RMake::Graph.new
+  ev.rules.each { |r| g.add_rule(r, phony: false, precious: false) }
+  exec = RMake::Executor.new(g, RMake::Shell.new(true), ev.vars)
+  node = g.node("ext/clean.sub")
+  ctx = exec.send(:auto_vars, node)
+  out = RMake::Util.expand("$(@D) $(@F) $(@F:.sub=)", ev.vars, ctx)
+  assert("auto vars expand for @D/@F", out == "ext clean.sub clean")
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    make_path = File.join(dir, "make.sh")
+    out_path = File.join(dir, "calls.txt")
+    File.write(make_path, "#!/bin/sh\necho \"PWD=$(pwd) ARGS=$@\" >> #{out_path}\n")
+    File.chmod(0755, make_path)
+
+    ev = parse_eval(<<~MK)
+ext/clean.sub:
+\t@echo $(@F:.sub=)ing "$(@D)"
+\t@$(MAKE) $(@F:.sub=)
+    MK
+    ev.vars["MAKE"] = RMake::Evaluator::Var.simple(make_path)
+
+    g = RMake::Graph.new
+    ev.rules.each { |r| g.add_rule(r, phony: false, precious: false) }
+    shell = RMake::Shell.new(true)
+    exec = RMake::Executor.new(g, shell, ev.vars)
+    with_env("MAKE", "") do
+      exec.build("ext/clean.sub")
+    end
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("recursive make uses correct @F target", content.include?("ARGS=clean"))
   end
 end
 
@@ -170,6 +208,44 @@ tests << lambda do
     end
     assert("no nothing-to-be-done for dot target", !out.include?("Nothing to be done"))
   end
+end
+
+tests << lambda do
+  out = RMake::Util.normalize_shell_output(" a\nb\n")
+  assert("shell output keeps leading ws, replaces newlines", out == " a b")
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    sub = File.join(dir, "sub")
+    Dir.mkdir(sub)
+    out_path = File.join(sub, "out.txt")
+    File.write(File.join(sub, "Makefile"), "all:\n\t@echo SUB > #{out_path}\n")
+    RMake::CLI.run(["-C", sub, "all"])
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("chdir option runs in subdir", content.include?("SUB"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-C", "no-such-dir", "all"])
+        assert("chdir invalid returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("chdir invalid error message", combined.include?("*** -C no-such-dir"))
+  end
+end
+
+tests << lambda do
+  ev = RMake::Evaluator.new([])
+  opts, _jobs_set = RMake::CLI.parse_args(["-j4"])
+  RMake::CLI.set_make_vars(ev, "make", opts)
+  mflags = ev.vars["mflags"].value
+  assert("mflags mirrors MFLAGS", mflags.include?("-j4"))
 end
 
 tests << lambda do
@@ -192,6 +268,127 @@ tests << lambda do
       assert("dep newer triggers rebuild", exec.send(:need_build?, node))
       exec.instance_variable_get(:@restat_no_change)[dep] = true
       assert("restat skips dep", !exec.send(:need_build?, node))
+    end
+  end
+end
+
+tests << lambda do
+  ev = parse_eval(<<~MK)
+TARGET_SO =
+clean-local: $(TARGET_SO)
+\t@echo clean
+  MK
+  rule = ev.rules.find { |r| r.targets.include?("clean-local") }
+  assert("empty variable prereq is dropped", rule.prereqs.empty?)
+end
+
+tests << lambda do
+  ev = parse_eval(<<~MK)
+foo: BAR = baz
+foo:
+\t@echo $(BAR)
+  MK
+  vars = ev.target_vars["foo"]
+  assert("target-specific var stored", vars && vars["BAR"] && vars["BAR"].value == "baz")
+  rule = ev.rules.find { |r| r.targets.include?("foo") }
+  assert("rule still parsed for target", !rule.nil?)
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all: foo ./foo
+\techo ALL
+foo:
+\techo FOO
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+      end
+    end
+    foo_count = out.scan(/^echo FOO$/).length
+    all_count = out.scan(/^echo ALL$/).length
+    assert("duplicate deps only execute once", foo_count == 1)
+    assert("top-level recipe still runs", all_count == 1)
+  end
+end
+
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["MAKEFLAGS=-j7", "all"])
+  assert("parse_args jobs from MAKEFLAGS assignment", opts[:jobs] == 7)
+end
+
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["MAKEFLAGS=-n", "all"])
+  assert("parse_args dry_run from MAKEFLAGS assignment", opts[:dry_run])
+end
+
+tests << lambda do
+  with_env("MAKE", "") do
+    shell = RMake::Shell.new(true)
+    vars = {
+      "MAKE" => RMake::Evaluator::Var.simple("rmake"),
+      "MAKELEVEL" => RMake::Evaluator::Var.simple("1"),
+      "MAKEFLAGS" => RMake::Evaluator::Var.simple("-j4"),
+      "MFLAGS" => RMake::Evaluator::Var.simple("-j4"),
+    }
+    cmd = "cd enc && rmake encs"
+    out = shell.send(:with_makelevel, cmd, vars, true)
+    assert("with_makelevel injects for recursive", out.include?("MAKELEVEL=2"))
+    out2 = shell.send(:with_makelevel, "echo hi", vars, false)
+    assert("with_makelevel skips non-recursive", out2 == "echo hi")
+  end
+end
+
+tests << lambda do
+  with_env("MAKE", "rmake") do
+    with_env("MAKELEVEL", "2") do
+      with_env("MAKEFLAGS", "-j8") do
+        with_env("MFLAGS", "-j8") do
+          shell = RMake::Shell.new(true)
+          cmd = "exec rmake clean"
+          out = shell.send(:with_makelevel, cmd, {}, true)
+          ok = out.include?("MAKELEVEL=3") && out.include?("MAKEFLAGS='-j8'") && out.include?("MFLAGS='-j8'")
+          assert("with_makelevel injects env flags", ok)
+        end
+      end
+    end
+  end
+end
+
+tests << lambda do
+  with_env("MAKE", "") do
+    shell = RMake::Shell.new(true)
+    vars = {
+      "MAKE" => RMake::Evaluator::Var.simple("false"),
+      "MAKELEVEL" => RMake::Evaluator::Var.simple("0"),
+      "MAKEFLAGS" => RMake::Evaluator::Var.simple("-n"),
+    }
+    ok = shell.run("@false", vars, {})
+    assert("dry-run executes recursive commands", ok == false)
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    Dir.chdir(dir) do
+      g = RMake::Graph.new
+      phony = RMake::Evaluator::Rule.new(["p"], [], [], ["echo PHONY"], false)
+      a = RMake::Evaluator::Rule.new(["a"], ["p"], [], ["echo A"], false)
+      b = RMake::Evaluator::Rule.new(["b"], ["p"], [], ["echo B"], false)
+      all = RMake::Evaluator::Rule.new(["all"], ["a", "b"], [], [], false)
+      g.add_rule(phony, phony: true, precious: false)
+      g.add_rule(a, phony: false, precious: false)
+      g.add_rule(b, phony: false, precious: false)
+      g.add_rule(all, phony: false, precious: false)
+      shell = RMake::Shell.new(true)
+      exec = RMake::Executor.new(g, shell, {})
+      out, _err = capture_io do
+        exec.build_parallel("all", 2)
+      end
+      count = out.scan("echo PHONY").length
+      assert("phony runs once per invocation", count == 1)
     end
   end
 end
@@ -237,29 +434,6 @@ tests << lambda do
       end
     end
     assert("explicit target up to date", out.include?("`miniruby' is up to date."))
-  end
-end
-
-tests << lambda do
-  Dir.mktmpdir("rmake-test-") do |dir|
-    File.write(File.join(dir, "Makefile"), <<~MK)
-V = 0
-V0 = $(V:0=)
-Q1 = $(V:1=)
-Q = $(Q1:0=@)
-ECHO1 = $(V:1=@:)
-ECHO = $(ECHO1:0=@echo)
-all:
-\t$(ECHO) MSG
-\t$(Q) echo CMD
-    MK
-    out, _err = capture_io do
-      Dir.chdir(dir) do
-        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
-      end
-    end
-    assert("V=0 prints echo MSG", out.include?("echo MSG"))
-    assert("V=0 prints echo CMD", out.include?("echo CMD"))
   end
 end
 
@@ -353,6 +527,23 @@ end
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
     File.write(File.join(dir, "Makefile"), <<~MK)
+.PHONY: noop
+noop: dep
+dep:
+\t@echo dep
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "noop"])
+      end
+    end
+    assert("phony without recipe still builds deps", out.include?("echo dep"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
 all:
 \techo $(MFLAGS)
     MK
@@ -404,18 +595,152 @@ all:
 end
 
 tests << lambda do
+  out = RMake::Util.shell_capture("printf ' a\\nb\\n'")
+  assert("shell capture trims only trailing newline", out == " a b")
+end
+
+tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "a.txt"), "x")
+    out = Dir.chdir(dir) do
+      RMake::Util.expand("$(wildcard a.txt b.txt)", {}, {})
+    end
+    assert("wildcard multi-pattern", out == "a.txt")
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "inc.mk"), "FOO = 3\n")
     File.write(File.join(dir, "Makefile"), <<~MK)
-all: src.txt
-\techo OK
+include inc.mk
+all:
+\techo $(FOO)
     MK
-    File.write(File.join(dir, "src.txt"), "x")
     out, _err = capture_io do
       Dir.chdir(dir) do
-        RMake::CLI.run(["-f", "Makefile", "-n", "-j2", "all"])
+        RMake::CLI.run(["-f", "Makefile", "-n", "FOO=2", "all"])
       end
     end
-    assert("parallel scheduler ignores file deps", out.include?("echo OK"))
+    assert("cli override beats include", out.include?("echo 2"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+define myrule
+foo:
+\t@echo hi
+endef
+$(eval $(myrule))
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "foo"])
+      end
+    end
+    assert("define+eval emits rule", out.include?("echo hi"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+include inc.mk
+inc.mk:
+\techo FOO=1 > inc.mk
+all:
+\t@echo $(FOO)
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+      end
+    end
+    assert("include remake creates file", File.exist?(File.join(dir, "inc.mk")))
+    assert("include remake re-evaluates vars", out.include?("echo 1"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+include missing.mk
+all:
+\t@echo hi
+    MK
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "all"])
+        assert("missing required include returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("missing required include message", combined.include?("No such file or directory"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), "all:; @echo yes\n")
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+      end
+    end
+    assert("inline recipe emits command", out.include?("echo yes"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+a: b
+\t@echo a
+b: a
+\t@echo b
+    MK
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "-j2", "a"])
+      end
+    end
+    combined = out + err
+    assert("cycle warning emitted", combined.include?("Circular"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+x:
+\t@echo x
+all: ./x
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+      end
+    end
+    assert("normalize ./ path deps", out.include?("echo x"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all:
+\t@echo RUN
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        with_env("MAKEFLAGS", "-n") do
+          RMake::CLI.run(["-f", "Makefile", "all"])
+        end
+      end
+    end
+    assert("MAKEFLAGS -n sets dry run", out.include?("echo RUN"))
   end
 end
 

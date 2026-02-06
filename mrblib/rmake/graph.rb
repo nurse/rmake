@@ -1,6 +1,6 @@
 module RMake
   class Graph
-    Node = Struct.new(:name, :deps, :order_only, :recipe, :phony, :precious, :double_colon)
+    Node = Struct.new(:name, :deps, :order_only, :recipe, :phony, :precious, :double_colon, :target_vars)
 
     def initialize
       @nodes = {}
@@ -10,7 +10,7 @@ module RMake
 
     def add_rule(rule, phony: false, precious: false)
       rule.targets.each do |t|
-        node = (@nodes[t] ||= Node.new(t, [], [], [], false, false, rule.double_colon))
+        node = (@nodes[t] ||= Node.new(t, [], [], [], false, false, rule.double_colon, {}))
         node.deps.concat(rule.prereqs)
         node.order_only.concat(rule.order_only)
         node.phony ||= phony
@@ -35,7 +35,7 @@ module RMake
     end
 
     def ensure_node(name)
-      @nodes[name] ||= Node.new(name, [], [], [], false, false, false)
+      @nodes[name] ||= Node.new(name, [], [], [], false, false, false, {})
     end
 
     def nodes
