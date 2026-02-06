@@ -32,12 +32,21 @@ module RMake
         begin
           evalr, graph = load_makefile(opts, make_cmd)
         rescue Errno::ENOENT
-          if Kernel.respond_to?(:warn)
-            warn "rmake: #{opts[:makefile]} not found"
+          if opts[:makefile] == "Makefile" || opts[:makefile] == "GNUmakefile"
+            if opts[:target] && !opts[:target].to_s.empty?
+              msg = "#{make_prefix}: *** No rule to make target `#{opts[:target]}'. Stop."
+            else
+              msg = "#{make_prefix}: *** No targets specified and no makefile found. Stop."
+            end
           else
-            puts "rmake: #{opts[:makefile]} not found"
+            msg = "#{make_prefix}: #{opts[:makefile]}: No such file or directory"
           end
-          return 1
+          if Kernel.respond_to?(:warn)
+            warn msg
+          else
+            puts msg
+          end
+          return 2
         end
         rebuilt = remake_includes(evalr, graph, opts, remade)
         pass += 1
@@ -144,8 +153,10 @@ module RMake
       includes.each do |path, optional|
         next if path.nil? || path.empty?
         next if remade && remade[path]
-        next if File.exist?(path)
         next unless exec.can_build?(path)
+        if File.exist?(path) && !exec.needs_build?(path)
+          next
+        end
         ok = exec.build_parallel(path, opts[:jobs])
         return false unless ok
         remade[path] = true if remade
@@ -281,6 +292,9 @@ module RMake
       ENV["MFLAGS"] = flags
       ENV["MAKEFLAGS"] = flags
       ENV["MAKECMDGOALS"] = opts[:target].to_s
+      if (ENV["MAKELEVEL"].nil? || ENV["MAKELEVEL"].empty?)
+        ENV["MAKELEVEL"] = "0"
+      end
     end
 
     def self.set_make_vars(evalr, make_cmd, opts)
@@ -303,18 +317,21 @@ module RMake
 
     def self.emit_nothing_to_do(target, opts)
       return 0 if target && target.start_with?(".")
+      if opts[:target] && !opts[:target].to_s.empty?
+        puts "#{make_prefix}: `#{target}' is up to date."
+      else
+        puts "#{make_prefix}: Nothing to be done for `#{target}'."
+      end
+      0
+    end
+
+    def self.make_prefix
       level = 0
       if Object.const_defined?(:ENV)
         lvl = ENV["MAKELEVEL"]
         level = lvl.to_i if lvl
       end
-      prefix = level > 0 ? "make[#{level}]" : "make"
-      if opts[:target] && !opts[:target].to_s.empty?
-        puts "#{prefix}: `#{target}' is up to date."
-      else
-        puts "#{prefix}: Nothing to be done for `#{target}'."
-      end
-      0
+      level > 0 ? "make[#{level}]" : "make"
     end
 
     def self.default_jobs

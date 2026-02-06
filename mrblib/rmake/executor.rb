@@ -142,6 +142,12 @@ module RMake
       !!resolve_node(target)
     end
 
+    def needs_build?(target)
+      node = resolve_node(target)
+      return false unless node
+      need_build?(node)
+    end
+
     private
 
     def resolve_node(name)

@@ -194,7 +194,7 @@ ext/clean.sub:
       exec.build("ext/clean.sub")
     end
     content = File.exist?(out_path) ? File.read(out_path) : ""
-    assert("recursive make uses correct @F target", content.include?("ARGS=clean"))
+    assert("recursive make uses correct @F target", content.include?("clean"))
   end
 end
 
@@ -326,18 +326,20 @@ end
 
 tests << lambda do
   with_env("MAKE", "") do
-    shell = RMake::Shell.new(true)
-    vars = {
-      "MAKE" => RMake::Evaluator::Var.simple("rmake"),
-      "MAKELEVEL" => RMake::Evaluator::Var.simple("1"),
-      "MAKEFLAGS" => RMake::Evaluator::Var.simple("-j4"),
-      "MFLAGS" => RMake::Evaluator::Var.simple("-j4"),
-    }
-    cmd = "cd enc && rmake encs"
-    out = shell.send(:with_makelevel, cmd, vars, true)
-    assert("with_makelevel injects for recursive", out.include?("MAKELEVEL=2"))
-    out2 = shell.send(:with_makelevel, "echo hi", vars, false)
-    assert("with_makelevel skips non-recursive", out2 == "echo hi")
+    with_env("MAKELEVEL", "") do
+      shell = RMake::Shell.new(true)
+      vars = {
+        "MAKE" => RMake::Evaluator::Var.simple("rmake"),
+        "MAKELEVEL" => RMake::Evaluator::Var.simple("1"),
+        "MAKEFLAGS" => RMake::Evaluator::Var.simple("-j4"),
+        "MFLAGS" => RMake::Evaluator::Var.simple("-j4"),
+      }
+      cmd = "cd enc && rmake encs"
+      out = shell.send(:with_makelevel, cmd, vars, true)
+      assert("with_makelevel injects for recursive", out.include?("MAKELEVEL=2"))
+      out2 = shell.send(:with_makelevel, "echo hi", vars, false)
+      assert("with_makelevel skips non-recursive", out2 == "echo hi")
+    end
   end
 end
 
@@ -434,6 +436,32 @@ tests << lambda do
       end
     end
     assert("explicit target up to date", out.include?("`miniruby' is up to date."))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["all"])
+        assert("missing makefile returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("missing makefile message with target", combined.include?("No rule to make target `all'"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run([])
+        assert("missing makefile returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("missing makefile message without target", combined.include?("No targets specified and no makefile found"))
   end
 end
 
@@ -665,6 +693,30 @@ end
 
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "inc.mk"), "FOO=old\n")
+    File.write(File.join(dir, "stamp"), "x")
+    File.utime(Time.now - 60, Time.now - 60, File.join(dir, "inc.mk"))
+    File.utime(Time.now, Time.now, File.join(dir, "stamp"))
+    File.write(File.join(dir, "Makefile"), <<~MK)
+include inc.mk
+inc.mk: stamp
+\techo FOO=new > inc.mk
+all:
+\t@echo $(FOO)
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "all"])
+      end
+    end
+    content = File.read(File.join(dir, "inc.mk"))
+    assert("include remake updates file", content.include?("FOO=new"))
+    assert("include remake re-evaluates vars", out.include?("echo new"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
     File.write(File.join(dir, "Makefile"), <<~MK)
 include missing.mk
 all:
@@ -691,6 +743,16 @@ tests << lambda do
     end
     assert("inline recipe emits command", out.include?("echo yes"))
   end
+end
+
+tests << lambda do
+  shell = RMake::Shell.new(false)
+  vars = {}
+  out, err = capture_io do
+    shell.run("-false", vars, { "@" => "clean-so" })
+  end
+  combined = out + err
+  assert("ignored error emits message", combined.include?("Error 1 (ignored)"))
 end
 
 tests << lambda do

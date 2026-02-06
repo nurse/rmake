@@ -21,7 +21,10 @@ module RMake
       end
       puts expanded unless silent
 
-      ok = run_command(exec_cmd)
+      ok, status = run_command(exec_cmd)
+      if ignore_fail && !ok
+        emit_ignored_error(env_vars, status, vars)
+      end
       ok || ignore_fail
     end
 
@@ -40,7 +43,10 @@ module RMake
         end
         script << "echo #{escape_sh(expanded)}\n" unless silent
         if ignore_fail
-          script << "#{exec_cmd} || true\n"
+          prefix = ignored_error_prefix(env_vars, vars).gsub("\"", "\\\"")
+          script << "if #{exec_cmd}; then :; else __rmake_status=$?; "
+          script << "echo \"#{prefix}$__rmake_status (ignored)\"; "
+          script << "fi\n"
         else
           script << "#{exec_cmd}\n"
         end
@@ -59,12 +65,15 @@ module RMake
 
     def run_command(cmd)
       if Kernel.respond_to?(:system)
-        return system(cmd)
+        ok = system(cmd)
+        code = $?.respond_to?(:exitstatus) ? $?.exitstatus : ($?.to_i)
+        return [ok, code || 1]
       end
       if Object.const_defined?(:Process) && Process.respond_to?(:spawn)
         pid = Process.spawn("/bin/sh", "-c", cmd)
         _, status = Process.waitpid2(pid)
-        return status.exitstatus == 0
+        code = status.exitstatus
+        return [code == 0, code]
       end
       if IO.respond_to?(:popen)
         IO.popen("/bin/sh -c #{escape_sh(cmd)}") do |io|
@@ -78,9 +87,10 @@ module RMake
             io.read
           end
         end
-        return $?.to_i == 0
+        code = $?.to_i
+        return [code == 0, code]
       end
-      false
+      [false, 1]
     end
 
     def with_makelevel(cmd, vars, recursive)
@@ -92,6 +102,24 @@ module RMake
       end
       make_cmd = var_value(vars, "MAKE") if (make_cmd.nil? || make_cmd.empty?) && vars
       return cmd if make_cmd.nil? || make_cmd.empty?
+      assign = recursive_make_assignments(vars)
+      return cmd if assign.empty?
+      inject = " #{assign}"
+      stripped = cmd.lstrip
+      if stripped.start_with?(make_cmd)
+        lead = cmd[0...(cmd.length - stripped.length)]
+        rest = stripped[make_cmd.length..-1].to_s
+        return lead + make_cmd + inject + rest
+      end
+      idx = cmd.index(make_cmd)
+      return cmd unless idx
+      before = cmd[0...idx]
+      return cmd unless idx == 0 || before.end_with?(" ", "\t", ";", "&", "|", "(")
+      after = cmd[(idx + make_cmd.length)..-1].to_s
+      before + make_cmd + inject + after
+    end
+
+    def recursive_make_assignments(vars)
       current = nil
       if Object.const_defined?(:ENV)
         current = ENV["MAKELEVEL"]
@@ -109,22 +137,7 @@ module RMake
       parts << "MAKEFLAGS=#{Util.shell_escape(flags)}" if flags && !flags.empty?
       mflags = var_value(vars, "MFLAGS") if (mflags.nil? || mflags.empty?) && vars
       parts << "MFLAGS=#{Util.shell_escape(mflags)}" if mflags && !mflags.empty?
-      prefix = parts.join(" ") + " "
-      stripped = cmd.lstrip
-      return prefix + cmd if stripped.start_with?(make_cmd)
-      idx = cmd.index(make_cmd)
-      return cmd unless idx
-      before = cmd[0...idx]
-      after = cmd[idx..-1]
-      before_strip = before.rstrip
-      if before_strip.end_with?("exec")
-        exec_idx = before_strip.rindex("exec")
-        if exec_idx && (exec_idx == 0 || " \t;&|(".include?(before_strip[exec_idx - 1]))
-          return before[0...exec_idx] + prefix + before[exec_idx..-1] + after
-        end
-      end
-      return cmd unless idx == 0 || before.end_with?(" ", "\t", ";", "&", "|", "(")
-      before + prefix + after
+      parts.join(" ")
     end
 
     def var_value(vars, name)
@@ -152,6 +165,46 @@ module RMake
 
     def escape_sh(str)
       "'" + str.gsub("'", "'\"'\"'") + "'"
+    end
+
+    def emit_ignored_error(env_vars, status, vars = nil)
+      line = ignored_error_line(env_vars, status, vars)
+      return if line.empty?
+      if Kernel.respond_to?(:warn)
+        warn line
+      else
+        puts line
+      end
+    end
+
+    def ignored_error_line(env_vars, status, vars = nil)
+      prefix = ignored_error_prefix(env_vars, vars)
+      return "" if prefix.empty?
+      status_i = status.nil? ? 1 : status.to_i
+      "#{prefix}#{status_i} (ignored)"
+    end
+
+    def ignored_error_prefix(env_vars, vars = nil)
+      target = nil
+      if env_vars && env_vars["@"] && !env_vars["@"].to_s.empty?
+        target = env_vars["@"].to_s
+      end
+      label = target ? "[#{target}]" : ""
+      prefix = "make"
+      level = nil
+      if Object.const_defined?(:ENV) && ENV["MAKELEVEL"]
+        level = ENV["MAKELEVEL"].to_i
+      end
+      if (level.nil? || level == 0) && vars && vars["MAKELEVEL"]
+        val = vars["MAKELEVEL"]
+        level = val.simple ? val.value.to_i : Util.expand(val.value.to_s, vars, {}).to_i
+      end
+      prefix = "make[#{level}]" if level && level > 0
+      if label.empty?
+        "#{prefix}: Error "
+      else
+        "#{prefix}: #{label} Error "
+      end
     end
 
   end
