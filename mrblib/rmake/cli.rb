@@ -292,7 +292,9 @@ module RMake
       ENV["MFLAGS"] = flags
       ENV["MAKEFLAGS"] = flags
       ENV["MAKECMDGOALS"] = opts[:target].to_s
-      if (ENV["MAKELEVEL"].nil? || ENV["MAKELEVEL"].empty?)
+      if opts[:vars] && opts[:vars]["MAKELEVEL"] && !opts[:vars]["MAKELEVEL"].empty?
+        ENV["MAKELEVEL"] = opts[:vars]["MAKELEVEL"]
+      elsif (ENV["MAKELEVEL"].nil? || ENV["MAKELEVEL"].empty?)
         ENV["MAKELEVEL"] = "0"
       end
     end

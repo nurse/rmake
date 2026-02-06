@@ -322,10 +322,11 @@ module RMake
     end
 
     def missing_dep_error(target, parent)
+      prefix = make_prefix
       msg = if parent && !parent.empty?
-        "rmake: *** No rule to make target `#{target}', needed by `#{parent}'. Stop."
+        "#{prefix}: *** No rule to make target `#{target}', needed by `#{parent}'.  Stop."
       else
-        "rmake: *** No rule to make target `#{target}'. Stop."
+        "#{prefix}: *** No rule to make target `#{target}'.  Stop."
       end
       if Kernel.respond_to?(:warn)
         warn msg
@@ -333,6 +334,21 @@ module RMake
         puts msg
       end
       false
+    end
+
+    def make_prefix
+      level = 0
+      if Object.const_defined?(:ENV)
+        lvl = ENV["MAKELEVEL"]
+        level = lvl.to_i if lvl && !lvl.empty?
+      end
+      if level == 0 && @vars
+        var = @vars["MAKELEVEL"]
+        if var
+          level = var.simple ? var.value.to_i : Util.expand(var.value.to_s, @vars, {}).to_i
+        end
+      end
+      level > 0 ? "make[#{level}]" : "make"
     end
 
     def validate_deps(target, parent, seen)

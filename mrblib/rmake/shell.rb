@@ -44,7 +44,7 @@ module RMake
         script << "echo #{escape_sh(expanded)}\n" unless silent
         if ignore_fail
           prefix = ignored_error_prefix(env_vars, vars).gsub("\"", "\\\"")
-          script << "if #{exec_cmd}; then :; else __rmake_status=$?; "
+          script << "if /bin/sh -c #{escape_sh(exec_cmd)}; then :; else __rmake_status=$?; "
           script << "echo \"#{prefix}$__rmake_status (ignored)\"; "
           script << "fi\n"
         else
@@ -104,19 +104,19 @@ module RMake
       return cmd if make_cmd.nil? || make_cmd.empty?
       assign = recursive_make_assignments(vars)
       return cmd if assign.empty?
-      inject = " #{assign}"
+      inject = "env #{assign} #{make_cmd}"
       stripped = cmd.lstrip
       if stripped.start_with?(make_cmd)
         lead = cmd[0...(cmd.length - stripped.length)]
         rest = stripped[make_cmd.length..-1].to_s
-        return lead + make_cmd + inject + rest
+        return lead + inject + rest
       end
       idx = cmd.index(make_cmd)
       return cmd unless idx
       before = cmd[0...idx]
       return cmd unless idx == 0 || before.end_with?(" ", "\t", ";", "&", "|", "(")
       after = cmd[(idx + make_cmd.length)..-1].to_s
-      before + make_cmd + inject + after
+      before + inject + after
     end
 
     def recursive_make_assignments(vars)
