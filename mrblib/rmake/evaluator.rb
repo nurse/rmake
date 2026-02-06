@@ -137,7 +137,11 @@ module RMake
           # Suffix rules like .c.o:
           if targets.length == 1 && targets[0].start_with?(".") && !targets[0].include?("/") && targets[0].count(".") == 2 && prereq_part_raw.to_s.strip.empty?
             src, dst = targets[0].split(".", 3)[1..2].map { |suf| ".#{suf}" }
-            @suffix_rules << [src, dst, prereqs, current_rule.recipe]
+            if @suffixes.empty? || @suffixes.include?(src) || @suffixes.include?(dst)
+              @suffix_rules << [src, dst, prereqs, current_rule.recipe]
+            else
+              @rules << current_rule
+            end
           else
             @rules << current_rule
           end

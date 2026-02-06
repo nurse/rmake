@@ -74,6 +74,17 @@ end
 
 tests << lambda do
   ev = parse_eval(<<~MK)
+.SUFFIXES: .c .o
+.revision.time:
+\t@echo revision
+  MK
+  suffix = ev.suffix_rules.map { |r| r[0..1].join("->") }
+  assert("unknown suffix pair is not suffix rule", suffix.none? { |x| x == ".revision->.time" })
+  assert("unknown suffix pair kept as normal rule", ev.rules.any? { |r| r.targets.include?(".revision.time") })
+end
+
+tests << lambda do
+  ev = parse_eval(<<~MK)
 ifeq (yes,no)
 foo:
 \t@echo nope
