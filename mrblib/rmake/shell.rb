@@ -229,8 +229,25 @@ module RMake
     def apply_recipe_exports(cmd, vars)
       return cmd if vars.nil?
       exports = var_value(vars, "__RMAKE_EXPORTS__")
-      return cmd if exports.nil? || exports.empty?
-      names = Util.split_ws(exports)
+      names = []
+      names.concat(Util.split_ws(exports)) if exports && !exports.empty?
+      env_keys = var_value(vars, "__RMAKE_ENV_KEYS__")
+      if env_keys && !env_keys.empty?
+        Util.split_ws(env_keys).each do |name|
+          next if name.nil? || name.empty?
+          names << name if vars[name]
+        end
+      end
+      seen = {}
+      names = names.reject do |name|
+        next true if name.nil? || name.empty?
+        if seen[name]
+          true
+        else
+          seen[name] = true
+          false
+        end
+      end
       return cmd if names.empty?
       assigns = []
       names.each do |name|

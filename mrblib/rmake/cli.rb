@@ -599,15 +599,18 @@ module RMake
     end
 
     def self.apply_env_vars(evalr, opts)
+      env_keys = []
       env_pairs.each do |k, v|
         next if k.nil? || k.empty?
         next if k == "PWD"
+        env_keys << k
         if opts[:env_override]
           evalr.set_env_var(k, v.to_s, true)
         else
           evalr.set_env_var(k, v.to_s, false) unless evalr.vars.key?(k)
         end
       end
+      evalr.set_special_var("__RMAKE_ENV_KEYS__", env_keys.join(" "), "default")
     end
 
     def self.env_pairs

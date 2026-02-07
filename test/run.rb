@@ -227,6 +227,73 @@ tests << lambda do
 end
 
 tests << lambda do
+  src = "FOO := $(shell echo '#') # tail"
+  got = RMake::Util.strip_comments(src)
+  assert("strip_comments keeps # inside function args", got.include?("echo '#'"))
+  assert("strip_comments strips trailing comment", !got.include?("tail"))
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    out_path = File.join(dir, "out.txt")
+    mk = <<~MK
+      .PHONY: all
+      PRE := $(.SHELLSTATUS)
+      $(shell exit 0)
+      OK := $(.SHELLSTATUS)
+      $(shell exit 1)
+      BAD := $(.SHELLSTATUS)
+      all: ; @echo PRE=$(PRE) OK=$(OK) BAD=$(BAD) > #{out_path}
+    MK
+    File.write(File.join(dir, "Makefile"), mk)
+    Dir.chdir(dir) do
+      status = RMake::CLI.run(["-f", "Makefile", "all"])
+      assert("shellstatus target success", status == 0)
+    end
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("shellstatus values", content.include?("PRE= OK=0 BAD=1"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    out_path = File.join(dir, "out.txt")
+    File.write(File.join(dir, "Makefile"), <<~MK)
+      FOO = bar
+      OUT = $(shell echo $$FOO)
+      all: ; @echo '$(OUT)' > #{out_path}
+    MK
+    with_env("FOO", "baz") do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "all"])
+        assert("shell env override target success", status == 0)
+      end
+    end
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("shell sees make override of env key", content.include?("bar"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    out_path = File.join(dir, "out.txt")
+    File.write(File.join(dir, "Makefile"), <<~MK)
+      HI = $(shell echo hi)
+      .PHONY: all
+      all: ; @echo $$HI > #{out_path}
+    MK
+    with_env("HI", "foo") do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "all"])
+        assert("recipe env target success", status == 0)
+      end
+    end
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("recipe sees make override of env key", content.include?("hi"))
+  end
+end
+
+tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
     sub = File.join(dir, "sub")
     Dir.mkdir(sub)

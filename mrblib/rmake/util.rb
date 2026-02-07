@@ -1,16 +1,38 @@
 module RMake
   module Util
     def self.strip_comments(line)
-      # Remove comments unless escaped. This is a minimal placeholder.
+      return line if line.nil?
       return line if line.index("#").nil?
-      in_escape = false
-      out = ""
-      line.each_char do |ch|
-        if ch == "#" && !in_escape
-          break
+      out = +""
+      closers = []
+      i = 0
+      while i < line.length
+        ch = line[i]
+        if ch == "$" && (line[i + 1] == "(" || line[i + 1] == "{")
+          closers << (line[i + 1] == "(" ? ")" : "}")
+          out << ch
+          i += 1
+          out << line[i]
+          i += 1
+          next
         end
-        in_escape = (ch == "\\") && !in_escape
+        if !closers.empty? && ch == closers[-1]
+          closers.pop
+          out << ch
+          i += 1
+          next
+        end
+        if ch == "#" && closers.empty?
+          bs = 0
+          j = i - 1
+          while j >= 0 && line[j] == "\\"
+            bs += 1
+            j -= 1
+          end
+          break if (bs % 2) == 0
+        end
         out << ch
+        i += 1
       end
       out
     end
@@ -228,8 +250,12 @@ module RMake
         return b.include?(a) ? a : ""
       when "shell"
         cmd = expand(args.to_s, vars, ctx)
-        cmd = with_exported_env(cmd, vars, ctx)
-        return shell_capture(cmd)
+        if ctx.nil? || !ctx["__skip_exported_env"]
+          cmd = with_exported_env(cmd, vars, ctx)
+        end
+        out, status = shell_capture_with_status(cmd, vars, ctx)
+        set_shellstatus(vars, ctx, status)
+        return out
       when "if"
         a, rest = split_func_args(args)
         b, c = split_func_args(rest)
@@ -798,63 +824,109 @@ module RMake
       [file, line, body]
     end
 
-    def self.shell_capture(cmd)
-      return "" if cmd.nil?
-      return "" if cmd.strip.empty?
+    def self.shell_capture(cmd, vars = nil, ctx = nil)
+      out, _status = shell_capture_with_status(cmd, vars, ctx)
+      out
+    end
+
+    def self.shell_capture_with_status(cmd, vars = nil, ctx = nil)
+      return ["", 0] if cmd.nil?
+      return ["", 0] if cmd.strip.empty?
       if Process.respond_to?(:spawn) && Process.respond_to?(:waitpid2)
         out = ""
+        err = ""
+        status = 0
         t = Time.now
         usec = t.respond_to?(:usec) ? t.usec : 0
         @shell_capture_seq ||= 0
         @shell_capture_seq += 1
         pid_part = (Process.respond_to?(:pid) ? Process.pid : 0)
-        tmp = "/tmp/rmake.shell.#{pid_part}.#{t.to_i}.#{usec}.#{@shell_capture_seq}"
+        tmp_out = "/tmp/rmake.shell.out.#{pid_part}.#{t.to_i}.#{usec}.#{@shell_capture_seq}"
+        tmp_err = "/tmp/rmake.shell.err.#{pid_part}.#{t.to_i}.#{usec}.#{@shell_capture_seq}"
         begin
-          sh_cmd = "#{cmd} > #{shell_escape(tmp)}"
+          sh_cmd = "#{cmd} > #{shell_escape(tmp_out)} 2> #{shell_escape(tmp_err)}"
           pid = Process.spawn("/bin/sh", "-c", sh_cmd)
-          Process.waitpid2(pid)
-          if File.exist?(tmp)
-            out = File.read(tmp).to_s
-          end
+          _, st = Process.waitpid2(pid)
+          status = shell_status_code(st)
+          out = File.exist?(tmp_out) ? File.read(tmp_out).to_s : ""
+          err = File.exist?(tmp_err) ? File.read(tmp_err).to_s : ""
+          emit_shell_stderr(err, cmd, status, vars, ctx)
         rescue
-          return ""
+          return ["", 127]
         ensure
-          File.delete(tmp) rescue nil
+          File.delete(tmp_out) rescue nil
+          File.delete(tmp_err) rescue nil
         end
         out = out.to_s
-        return normalize_shell_output(out)
+        return [normalize_shell_output(out), status]
       end
       if IO.respond_to?(:popen)
         out = ""
+        err = ""
+        status = 0
+        t = Time.now
+        usec = t.respond_to?(:usec) ? t.usec : 0
+        @shell_capture_seq ||= 0
+        @shell_capture_seq += 1
+        pid_part = (Process.respond_to?(:pid) ? Process.pid : 0)
+        tmp_out = "/tmp/rmake.shell.out.#{pid_part}.#{t.to_i}.#{usec}.#{@shell_capture_seq}"
+        tmp_err = "/tmp/rmake.shell.err.#{pid_part}.#{t.to_i}.#{usec}.#{@shell_capture_seq}"
         begin
-          IO.popen("/bin/sh -c #{shell_escape(cmd)}") { |io| out = io.read.to_s }
+          Kernel.system("/bin/sh -c #{shell_escape("#{cmd} > #{shell_escape(tmp_out)} 2> #{shell_escape(tmp_err)}")}")
+          st = $?
+          status = shell_status_code(st)
+          out = File.exist?(tmp_out) ? File.read(tmp_out).to_s : ""
+          err = File.exist?(tmp_err) ? File.read(tmp_err).to_s : ""
+          emit_shell_stderr(err, cmd, status, vars, ctx)
           out = out.to_s
-          return normalize_shell_output(out)
+          return [normalize_shell_output(out), status]
         rescue
-          return ""
+          return ["", 127]
+        ensure
+          File.delete(tmp_out) rescue nil
+          File.delete(tmp_err) rescue nil
         end
       end
-      ""
+      ["", 127]
     end
 
     def self.with_exported_env(cmd, vars, ctx = {})
       return cmd if cmd.nil? || cmd.empty?
       return cmd if vars.nil?
+      ctx2 = ctx ? ctx.dup : {}
+      ctx2["__skip_exported_env"] = true
       exports_var = vars["__RMAKE_EXPORTS__"]
-      return cmd unless exports_var
-      exports = if exports_var.simple
-        exports_var.value.to_s
-      else
-        expand(exports_var.value.to_s, vars, ctx || {})
+      names = []
+      if exports_var
+        exports = if exports_var.simple
+          exports_var.value.to_s
+        else
+          expand(exports_var.value.to_s, vars, ctx2)
+        end
+        names.concat(split_ws(exports))
       end
-      names = split_ws(exports)
+      if Object.const_defined?(:ENV)
+        ENV.each_key do |name|
+          next if name.nil? || name.empty?
+          names << name if vars[name]
+        end
+      end
+      env_keys_var = vars["__RMAKE_ENV_KEYS__"]
+      if env_keys_var
+        env_keys = env_keys_var.simple ? env_keys_var.value.to_s : expand(env_keys_var.value.to_s, vars, ctx2)
+        split_ws(env_keys).each do |name|
+          next if name.nil? || name.empty?
+          names << name if vars[name]
+        end
+      end
+      names = uniq_words(names)
       return cmd if names.empty?
       assigns = []
       names.each do |name|
         next if name.nil? || name.empty?
         val = nil
         if (var = vars[name])
-          val = var.simple ? var.value.to_s : expand(var.value.to_s, vars, ctx || {})
+          val = var.simple ? var.value.to_s : expand(var.value.to_s, vars, ctx2)
         else
           val = env_value(name)
         end
@@ -874,6 +946,102 @@ module RMake
         s = s[0...-1]
       end
       s.tr("\n", " ")
+    end
+
+    def self.uniq_words(words)
+      out = []
+      seen = {}
+      words.each do |w|
+        next if w.nil? || w.empty?
+        next if seen[w]
+        seen[w] = true
+        out << w
+      end
+      out
+    end
+
+    def self.shell_status_code(status_obj)
+      return 127 if status_obj.nil?
+      if status_obj.respond_to?(:signaled?) && status_obj.signaled?
+        sig = status_obj.respond_to?(:termsig) ? status_obj.termsig.to_i : 0
+        return 128 + sig
+      end
+      if status_obj.respond_to?(:exitstatus)
+        st = status_obj.exitstatus
+        return st.nil? ? 0 : st.to_i
+      end
+      raw = status_obj.to_i
+      return raw if raw <= 255
+      (raw >> 8)
+    end
+
+    def self.make_invocation_name(vars = nil, ctx = nil)
+      if vars && vars["MAKE"]
+        var = vars["MAKE"]
+        raw = var.simple ? var.value.to_s : expand(var.value.to_s, vars, ctx || {})
+        first = split_ws(raw).first
+        return File.basename(first) if first && !first.empty?
+      end
+      if ctx && ctx["__evaluator"] && ctx["__evaluator"].respond_to?(:vars)
+        evars = ctx["__evaluator"].vars
+        if evars && evars["MAKE"]
+          var = evars["MAKE"]
+          raw = var.simple ? var.value.to_s : expand(var.value.to_s, evars, ctx || {})
+          first = split_ws(raw).first
+          return File.basename(first) if first && !first.empty?
+        end
+      end
+      if Object.const_defined?(:ENV)
+        mk = ENV["MAKE"]
+        if mk && !mk.empty?
+          first = split_ws(mk).first
+          return File.basename(first) if first && !first.empty?
+        end
+      end
+      "make"
+    end
+
+    def self.rewrite_shell_stderr(err, status, vars = nil, ctx = nil)
+      s = err.to_s
+      return s if status != 127
+      prefix = make_invocation_name(vars, ctx)
+      lines = s.split("\n", -1)
+      out = []
+      lines.each do |line|
+        if line.start_with?("/bin/sh: ")
+          body = line[9..-1].to_s
+          body = body[8..-1].to_s if body.start_with?("line ")
+          out << "#{prefix}: #{body}"
+        else
+          out << line
+        end
+      end
+      out.join("\n")
+    end
+
+    def self.emit_shell_stderr(err, _cmd, status, vars = nil, ctx = nil)
+      return if err.nil? || err.empty?
+      text = rewrite_shell_stderr(err, status, vars, ctx)
+      if Object.const_defined?(:STDERR) && STDERR.respond_to?(:write)
+        STDERR.write(text)
+        STDERR.write("\n") unless text.end_with?("\n")
+      else
+        puts text
+      end
+    end
+
+    def self.set_shellstatus(vars, ctx, status)
+      st = status.to_i.to_s
+      evaluator = ctx ? ctx["__evaluator"] : nil
+      if evaluator && evaluator.respond_to?(:set_special_var)
+        evaluator.set_special_var(".SHELLSTATUS", st, "automatic")
+        return
+      end
+      return if vars.nil?
+      if Object.const_defined?(:RMake) && RMake.const_defined?(:Evaluator) &&
+         RMake::Evaluator.const_defined?(:Var)
+        vars[".SHELLSTATUS"] = RMake::Evaluator::Var.simple(st)
+      end
     end
 
     def self.strip_leading_ws(str)
