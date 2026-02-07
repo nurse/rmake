@@ -615,7 +615,7 @@ tests << lambda do
       end
     end
     combined = out + err
-    assert("question mode missing dep message", combined.include?("No rule to make target `missing'"))
+    assert("question mode missing dep message", combined.include?("No rule to make target 'missing'"))
   end
 end
 
@@ -744,7 +744,7 @@ tests << lambda do
       end
     end
     combined = out + err
-    assert("missing makefile message with target", combined.include?("No rule to make target `all'"))
+    assert("missing makefile message with target", combined.include?("No rule to make target 'all'"))
   end
 end
 
@@ -810,7 +810,7 @@ tests << lambda do
       end
     end
     combined = out + err
-    assert("missing dep message", combined.include?("No rule to make target `missing'"))
+    assert("missing dep message", combined.include?("No rule to make target 'missing'"))
   end
 end
 

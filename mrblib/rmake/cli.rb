@@ -38,7 +38,7 @@ module RMake
             if opts[:makefile] == "Makefile" || opts[:makefile] == "GNUmakefile"
               first_goal = explicit_targets(opts).first
               if first_goal && !first_goal.to_s.empty?
-                msg = "#{make_prefix}: *** No rule to make target `#{first_goal}'. Stop."
+                msg = "#{make_prefix}: *** No rule to make target '#{first_goal}'. Stop."
               else
                 msg = "#{make_prefix}: *** No targets specified and no makefile found. Stop."
               end
@@ -90,8 +90,8 @@ module RMake
           return 1
         end
 
-        shell = Shell.new(opts[:dry_run], opts[:silent])
-        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr)
+        shell = Shell.new(opts[:dry_run], opts[:silent], opts[:ignore_errors])
+        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
         begin
           if opts[:question]
             q = 0
@@ -161,14 +161,25 @@ module RMake
     end
 
     def self.load_makefile(opts, make_cmd)
-      File.open(opts[:makefile], "r") do |io|
-        lines = Parser.new(io, opts[:makefile]).parse
+      lines = []
+      if File.exist?(opts[:makefile])
+        File.open(opts[:makefile], "r") do |io|
+          lines = Parser.new(io, opts[:makefile]).parse
+        end
+      elsif opts[:evals].nil? || opts[:evals].empty?
+        raise Errno::ENOENT
+      end
+      begin
         evalr = Evaluator.new(lines)
         evalr.set_env_override(opts[:env_override]) if evalr.respond_to?(:set_env_override)
+        evalr.set_include_dirs(opts[:include_dirs]) if evalr.respond_to?(:set_include_dirs)
         apply_env_vars(evalr, opts)
         set_make_vars(evalr, make_cmd, opts)
+        evalr.set_no_builtin_rules(true) if opts[:no_builtin_rules]
+        evalr.set_no_builtin_variables(true) if opts[:no_builtin_variables]
         apply_cli_assignments(evalr, opts)
         evalr.evaluate
+        apply_cli_evals(evalr, opts)
         graph = Graph.new
         evalr.rules.each do |r|
           if r.targets.length > 1
@@ -217,7 +228,7 @@ module RMake
       includes = evalr.includes
       return false if includes.nil? || includes.empty?
 
-      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], nil, evalr.suffixes, evalr.second_expansion?, evalr)
+      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], nil, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
       rebuilt = false
       includes.each do |path, optional|
         next if path.nil? || path.empty?
@@ -249,7 +260,7 @@ module RMake
       missing = []
       checker = nil
       if opts[:dry_run]
-        checker = Executor.new(graph, Shell.new(true, opts[:silent]), evalr.vars, evalr.delete_on_error?, false, nil, evalr.suffixes, evalr.second_expansion?, evalr)
+        checker = Executor.new(graph, Shell.new(true, opts[:silent]), evalr.vars, evalr.delete_on_error?, false, nil, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
       end
       evalr.missing_required.each do |path|
         next if path.nil? || path.empty?
@@ -286,16 +297,29 @@ module RMake
         jobs: 1,
         dry_run: false,
         silent: false,
+        ignore_errors: false,
+        no_silent: false,
+        keep_going: false,
+        touch: false,
+        no_builtin_rules: false,
+        no_builtin_variables: false,
+        always_make: false,
+        no_print_directory: false,
         question: false,
         env_override: false,
         target: nil,
         targets: [],
+        evals: [],
+        include_dirs: [],
+        what_if: [],
         vars: {},
         var_assigns: [],
         trace: false,
         help: false,
       }
       jobs_set = false
+      silent_set = false
+      print_dir_set = false
       i = 0
       while i < argv.length
         arg = argv[i]
@@ -318,12 +342,90 @@ module RMake
           jobs_set = true
         elsif arg == "-n"
           opts[:dry_run] = true
-        elsif arg == "-s" || arg == "--silent"
+        elsif arg == "-i" || arg == "--ignore-errors"
+          opts[:ignore_errors] = true
+        elsif arg == "-k" || arg == "--keep-going"
+          opts[:keep_going] = true
+        elsif arg == "-S" || arg == "--no-keep-going"
+          opts[:keep_going] = false
+        elsif arg == "-r" || arg == "--no-builtin-rules"
+          opts[:no_builtin_rules] = true
+        elsif arg == "-R" || arg == "--no-builtin-variables"
+          opts[:no_builtin_variables] = true
+        elsif arg == "-B" || arg == "--always-make"
+          opts[:always_make] = true
+        elsif arg == "-t" || arg == "--touch"
+          opts[:touch] = true
+        elsif arg == "-s" || arg == "--silent" || arg == "--quiet"
           opts[:silent] = true
+          opts[:no_silent] = false
+          silent_set = true
+        elsif arg == "--no-silent"
+          opts[:silent] = false
+          opts[:no_silent] = true
+          silent_set = true
+        elsif arg == "-w" || arg == "--print-directory"
+          opts[:print_directory] = true
+          opts[:no_print_directory] = false
+          print_dir_set = true
+        elsif arg == "--no-print-directory"
+          opts[:print_directory] = false
+          opts[:no_print_directory] = true
+          print_dir_set = true
         elsif arg == "-e" || arg == "--environment-overrides"
           opts[:env_override] = true
         elsif arg == "-q" || arg == "--question"
           opts[:question] = true
+        elsif arg == "-E" || arg == "--eval"
+          i += 1
+          opts[:evals] << argv[i].to_s if i < argv.length
+        elsif arg.start_with?("--eval=")
+          opts[:evals] << arg.split("=", 2)[1].to_s
+        elsif arg == "-I"
+          i += 1
+          opts[:include_dirs] << argv[i].to_s if i < argv.length
+        elsif arg.start_with?("--include-dir=")
+          opts[:include_dirs] << arg.split("=", 2)[1].to_s
+        elsif arg == "-W"
+          i += 1
+          opts[:what_if] << argv[i].to_s if i < argv.length
+        elsif arg.start_with?("--what-if=") || arg.start_with?("--new-file=") || arg.start_with?("--assume-new=")
+          opts[:what_if] << arg.split("=", 2)[1].to_s
+        elsif arg == "-l" || arg == "--load-average" || arg == "--max-load"
+          nxt = argv[i + 1]
+          if nxt && !nxt.start_with?("-")
+            i += 1
+            opts[:load_average] = nxt
+          end
+        elsif arg.start_with?("--load-average=") || arg.start_with?("--max-load=")
+          opts[:load_average] = arg.split("=", 2)[1].to_s
+        elsif arg.start_with?("--warn")
+          opts[:warn_spec] = arg
+        elsif arg.start_with?("--shuffle")
+          opts[:shuffle] = arg
+        elsif arg.start_with?("--jobserver-style=")
+          opts[:jobserver_style] = arg.split("=", 2)[1].to_s
+        elsif arg == "-O" || arg == "--output-sync"
+          opts[:output_sync] = true
+        elsif arg.start_with?("--output-sync=")
+          opts[:output_sync] = arg.split("=", 2)[1].to_s
+        elsif arg == "-p" || arg == "--print-data-base" || arg == "-b" || arg == "-m"
+          # Accepted for compatibility; behavior is currently ignored.
+        elsif arg == "--"
+          i += 1
+          while i < argv.length
+            rest = argv[i]
+            if (assign = parse_cli_assignment(rest))
+              name, op, val = assign
+              opts[:var_assigns] << assign
+              opts[:vars][name] = val if op == "="
+            else
+              opts[:targets] << rest
+              opts[:target] = rest
+            end
+            i += 1
+          end
+          break
         elsif arg == "-d" || arg == "--trace"
           opts[:trace] = true
         elsif !arg.start_with?("-") && (assign = parse_cli_assignment(arg))
@@ -335,6 +437,24 @@ module RMake
         elsif arg.start_with?("-j") && arg.length > 2
           opts[:jobs] = normalize_jobs(arg[2..-1].to_i)
           jobs_set = true
+        elsif arg.start_with?("-f") && arg.length > 2
+          opts[:makefile] = arg[2..-1]
+        elsif arg.start_with?("-E") && arg.length > 2
+          opts[:evals] << arg[2..-1]
+        elsif arg.start_with?("-I") && arg.length > 2
+          opts[:include_dirs] << arg[2..-1]
+        elsif arg.start_with?("-W") && arg.length > 2
+          opts[:what_if] << arg[2..-1]
+        elsif arg.start_with?("-l") && arg.length > 2
+          opts[:load_average] = arg[2..-1]
+        elsif arg.start_with?("-") && arg.length > 2 && !arg.start_with?("--")
+          handled, ni, jobs_set = parse_short_bundle(opts, argv, i, jobs_set)
+          if handled
+            i = ni
+          else
+            opts[:targets] << arg
+            opts[:target] = arg
+          end
         else
           opts[:targets] << arg
           opts[:target] = arg
@@ -356,6 +476,47 @@ module RMake
         end
       end
 
+      if !opts[:env_override]
+        flags = nil
+        flags = cli_var_value(opts, "MAKEFLAGS")
+        flags = cli_var_value(opts, "MFLAGS") if flags.nil? || flags.empty?
+        if flags.nil? || flags.empty?
+          flags = env_var("MAKEFLAGS")
+          flags = env_var("MFLAGS") if (flags.nil? || flags.empty?)
+        end
+        opts[:env_override] = env_override_from_flags(flags) if flags && !flags.empty?
+      end
+
+      if !silent_set
+        flags = nil
+        flags = cli_var_value(opts, "MAKEFLAGS")
+        flags = cli_var_value(opts, "MFLAGS") if flags.nil? || flags.empty?
+        if flags.nil? || flags.empty?
+          flags = env_var("MAKEFLAGS")
+          flags = env_var("MFLAGS") if (flags.nil? || flags.empty?)
+        end
+        s = silent_from_flags(flags)
+        unless s.nil?
+          opts[:silent] = s
+          opts[:no_silent] = !s
+        end
+      end
+
+      if !print_dir_set
+        flags = nil
+        flags = cli_var_value(opts, "MAKEFLAGS")
+        flags = cli_var_value(opts, "MFLAGS") if flags.nil? || flags.empty?
+        if flags.nil? || flags.empty?
+          flags = env_var("MAKEFLAGS")
+          flags = env_var("MFLAGS") if (flags.nil? || flags.empty?)
+        end
+        pd = print_directory_from_flags(flags)
+        unless pd.nil?
+          opts[:print_directory] = pd
+          opts[:no_print_directory] = !pd
+        end
+      end
+
       if !jobs_set
         flags = cli_var_value(opts, "MAKEFLAGS")
         flags = cli_var_value(opts, "MFLAGS") if flags.nil? || flags.empty?
@@ -371,6 +532,93 @@ module RMake
         opts[:jobs] = detected if detected && detected > 0
       end
       [opts, jobs_set]
+    end
+
+    def self.short_option_cluster?(flags)
+      return false if flags.nil? || flags.empty?
+      flags.each_char.all? { |ch| short_option_char?(ch) }
+    end
+
+    def self.short_option_char?(ch)
+      ch == "n" || ch == "s" || ch == "e" || ch == "q" || ch == "d" ||
+        ch == "i" || ch == "k" || ch == "S" || ch == "r" || ch == "R" ||
+        ch == "t" || ch == "w" || ch == "B" || ch == "p" || ch == "b" || ch == "m"
+    end
+
+    def self.apply_short_flag(opts, ch)
+      case ch
+      when "n" then opts[:dry_run] = true
+      when "s" then opts[:silent] = true
+      when "e" then opts[:env_override] = true
+      when "q" then opts[:question] = true
+      when "d" then opts[:trace] = true
+      when "i" then opts[:ignore_errors] = true
+      when "k" then opts[:keep_going] = true
+      when "S" then opts[:keep_going] = false
+      when "r" then opts[:no_builtin_rules] = true
+      when "R" then opts[:no_builtin_variables] = true
+      when "t" then opts[:touch] = true
+      when "w"
+        opts[:print_directory] = true
+        opts[:no_print_directory] = false
+      when "B" then opts[:always_make] = true
+      else
+        # accepted no-op compatibility options
+      end
+    end
+
+    def self.parse_short_bundle(opts, argv, i, jobs_set)
+      arg = argv[i].to_s
+      return [false, i, jobs_set] unless arg.start_with?("-") && arg.length > 2 && !arg.start_with?("--")
+      flags = arg[1..-1]
+      idx = 0
+      while idx < flags.length
+        ch = flags[idx]
+        if short_option_char?(ch)
+          apply_short_flag(opts, ch)
+          idx += 1
+          next
+        end
+        if ch == "f" || ch == "C" || ch == "I" || ch == "W" || ch == "E"
+          rest = flags[(idx + 1)..-1].to_s
+          if rest.empty?
+            i += 1
+            rest = argv[i].to_s if i < argv.length
+          end
+          return [false, i, jobs_set] if rest.nil? || rest.empty?
+          if ch == "f"
+            opts[:makefile] = rest
+          elsif ch == "C"
+            opts[:chdir] = rest
+          elsif ch == "I"
+            opts[:include_dirs] << rest
+          elsif ch == "W"
+            opts[:what_if] << rest
+          elsif ch == "E"
+            opts[:evals] << rest
+          end
+          return [true, i, jobs_set]
+        end
+        if ch == "j" || ch == "l"
+          rest = flags[(idx + 1)..-1].to_s
+          if rest.empty?
+            nxt = argv[i + 1]
+            if nxt && !nxt.start_with?("-")
+              i += 1
+              rest = nxt
+            end
+          end
+          if ch == "j"
+            opts[:jobs] = normalize_jobs(rest.to_i)
+            jobs_set = true
+          else
+            opts[:load_average] = rest unless rest.nil? || rest.empty?
+          end
+          return [true, i, jobs_set]
+        end
+        return [false, i, jobs_set]
+      end
+      [true, i, jobs_set]
     end
 
     def self.normalize_jobs(n)
@@ -397,15 +645,11 @@ module RMake
     def self.set_env_make_vars(make_cmd, opts)
       return unless Object.const_defined?(:ENV)
       ENV["MAKE"] = make_cmd
-      flags = []
-      flags << "-j#{opts[:jobs]}" if opts[:jobs] > 1
-      flags << "-s" if opts[:silent]
-      flags << "-e" if opts[:env_override]
-      flags << "-n" if opts[:dry_run]
-      flags << "-q" if opts[:question]
-      flags = flags.join(" ").strip
-      ENV["MFLAGS"] = flags
-      ENV["MAKEFLAGS"] = flags
+      mflags = mflags_for(opts)
+      ENV["MFLAGS"] = mflags
+      ENV["MAKEFLAGS"] = makeflags_for(opts, mflags)
+      ENV["__RMAKE_ENV_OVERRIDE__"] = opts[:env_override] ? "1" : ""
+      ENV["__RMAKE_CLI_ASSIGNS_ESC"] = cli_assigns_escaped(opts)
       ENV["MAKECMDGOALS"] = explicit_targets(opts).join(" ")
       makelevel = cli_var_value(opts, "MAKELEVEL")
       if makelevel && !makelevel.empty?
@@ -417,7 +661,7 @@ module RMake
 
     def self.capture_make_env
       return {} unless Object.const_defined?(:ENV)
-      keys = ["MAKE", "MFLAGS", "MAKEFLAGS", "MAKECMDGOALS", "MAKELEVEL"]
+      keys = ["MAKE", "MFLAGS", "MAKEFLAGS", "MAKECMDGOALS", "MAKELEVEL", "__RMAKE_ENV_OVERRIDE__", "__RMAKE_CLI_ASSIGNS_ESC"]
       out = {}
       keys.each do |k|
         if ENV.key?(k)
@@ -443,16 +687,12 @@ module RMake
 
     def self.set_make_vars(evalr, make_cmd, opts)
       evalr.set_special_var("MAKE", make_cmd, "default")
-      flags = []
-      flags << "-j#{opts[:jobs]}" if opts[:jobs] > 1
-      flags << "-s" if opts[:silent]
-      flags << "-e" if opts[:env_override]
-      flags << "-n" if opts[:dry_run]
-      flags << "-q" if opts[:question]
-      flags = flags.join(" ").strip
-      evalr.set_special_var("MFLAGS", flags, "default")
-      evalr.set_special_var("mflags", flags, "default")
-      evalr.set_special_var("MAKEFLAGS", flags, "default")
+      mflags = mflags_for(opts)
+      evalr.set_special_var("MFLAGS", mflags, "default")
+      evalr.set_special_var("mflags", mflags, "default")
+      evalr.set_special_var("MAKEFLAGS", makeflags_for(opts, mflags), "default")
+      evalr.set_special_var("__RMAKE_ENV_OVERRIDE__", opts[:env_override] ? "1" : "", "default")
+      evalr.set_special_var("__RMAKE_CLI_ASSIGNS_ESC", cli_assigns_escaped(opts), "default")
       evalr.set_special_var("MAKECMDGOALS", explicit_targets(opts).join(" "), "default")
       unless cli_var_assigned?(opts, "MAKELEVEL")
         level = 0
@@ -491,6 +731,9 @@ module RMake
       if Object.const_defined?(:ENV)
         lvl = ENV["MAKELEVEL"]
         level = lvl.to_i if lvl
+      else
+        lvl = env_var("MAKELEVEL")
+        level = lvl.to_i if lvl && !lvl.empty?
       end
       level > 0 ? "#{base}[#{level}]" : base
     end
@@ -560,13 +803,122 @@ module RMake
     def self.dry_run_from_flags(flags)
       return false unless flags && !flags.empty?
       parts = Util.split_ws(flags)
-      parts.any? { |p| p == "-n" || p == "--just-print" || p == "--dry-run" }
+      parts.any? { |p| p == "-n" || p == "--just-print" || p == "--dry-run" || token_has_short_option?(p, "n") }
     end
 
     def self.question_from_flags(flags)
       return false unless flags && !flags.empty?
       parts = Util.split_ws(flags)
-      parts.any? { |p| p == "-q" || p == "--question" }
+      parts.any? { |p| p == "-q" || p == "--question" || token_has_short_option?(p, "q") }
+    end
+
+    def self.env_override_from_flags(flags)
+      return false unless flags && !flags.empty?
+      parts = Util.split_ws(flags)
+      parts.any? { |p| p == "-e" || p == "--environment-overrides" || token_has_short_option?(p, "e") }
+    end
+
+    def self.token_has_short_option?(token, flag)
+      return false if token.nil? || token.empty?
+      if !token.start_with?("-")
+        return false if token.include?("=")
+        return alpha_token?(token) && token.index(flag) != nil
+      end
+      return false if token.start_with?("--")
+      chars = token[1..-1].to_s
+      i = 0
+      while i < chars.length
+        ch = chars[i]
+        return true if ch == flag
+        break if short_option_requires_arg?(ch)
+        i += 1
+      end
+      false
+    end
+
+    def self.short_option_requires_arg?(ch)
+      ch == "C" || ch == "f" || ch == "I" || ch == "W" || ch == "E" || ch == "j" || ch == "l"
+    end
+
+    def self.alpha_token?(token)
+      return false if token.nil? || token.empty?
+      i = 0
+      while i < token.length
+        ch = token[i]
+        code = ch.ord
+        upper = code >= 65 && code <= 90
+        lower = code >= 97 && code <= 122
+        return false unless upper || lower
+        i += 1
+      end
+      true
+    end
+
+    def self.silent_from_flags(flags)
+      return nil unless flags && !flags.empty?
+      out = nil
+      Util.split_ws(flags).each do |p|
+        if p == "--no-silent"
+          out = false
+        elsif p == "--silent" || p == "--quiet" || token_has_short_option?(p, "s")
+          out = true
+        end
+      end
+      out
+    end
+
+    def self.print_directory_from_flags(flags)
+      return nil unless flags && !flags.empty?
+      out = nil
+      Util.split_ws(flags).each do |p|
+        if p == "--no-print-directory"
+          out = false
+        elsif p == "-w" || p == "--print-directory" || token_has_short_option?(p, "w")
+          out = true
+        end
+      end
+      out
+    end
+
+    def self.mflags_for(opts)
+      flags = []
+      flags << "-j#{opts[:jobs]}" if opts[:jobs] > 1
+      flags << "-s" if opts[:silent]
+      flags << "-e" if opts[:env_override]
+      flags << "-n" if opts[:dry_run]
+      flags << "-q" if opts[:question]
+      flags << "-r" if opts[:no_builtin_rules]
+      flags << "-R" if opts[:no_builtin_variables]
+      flags.join(" ").strip
+    end
+
+    def self.makeflags_for(opts, mflags = nil)
+      short = ""
+      short << "s" if opts[:silent]
+      short << "e" if opts[:env_override]
+      short << "n" if opts[:dry_run]
+      short << "q" if opts[:question]
+      short << "r" if opts[:no_builtin_rules]
+      short << "R" if opts[:no_builtin_variables]
+      mf = short.dup
+      mflags = mflags_for(opts) if mflags.nil?
+      if mflags.include?("-j")
+        jpart = mflags.split(" ").find { |x| x.start_with?("-j") }
+        mf = mf.empty? ? " #{jpart}" : "#{mf} #{jpart}" if jpart
+      end
+      mf = mf.to_s
+      mf += " --no-silent" if opts[:no_silent]
+      mf += " --no-print-directory" if opts[:no_print_directory]
+      mf
+    end
+
+    def self.cli_assigns_escaped(opts)
+      assigns = opts[:var_assigns]
+      return "" if assigns.nil? || assigns.empty?
+      parts = assigns.map do |name, op, value|
+        Util.shell_escape("#{name}#{op}#{value}")
+      end
+      parts.join(" ")
     end
 
     def self.default_target(explicit, evalr, graph)
@@ -611,6 +963,15 @@ module RMake
         end
       end
       evalr.set_special_var("__RMAKE_ENV_KEYS__", env_keys.join(" "), "default")
+    end
+
+    def self.apply_cli_evals(evalr, opts)
+      evals = opts[:evals]
+      return if evals.nil? || evals.empty?
+      evals.each do |snippet|
+        next if snippet.nil?
+        evalr.send(:eval_text, snippet.to_s, {})
+      end
     end
 
     def self.env_pairs

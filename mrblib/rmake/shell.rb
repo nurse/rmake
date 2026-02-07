@@ -1,8 +1,13 @@
 module RMake
   class Shell
-    def initialize(dry_run = false, silent = false)
+    def initialize(dry_run = false, silent = false, ignore_errors = false)
       @dry_run = dry_run
       @silent = silent
+      @ignore_errors = ignore_errors
+    end
+
+    def dry_run?
+      @dry_run
     end
 
     def self.supports_spawn?
@@ -25,18 +30,23 @@ module RMake
         silent, ignore_fail, force, line_cmd = Util.strip_cmd_prefixes(line.to_s)
         silent ||= base_silent
         ignore_fail ||= base_ignore
+        ignore_fail ||= @ignore_errors
         force ||= base_force
         next if line_cmd.nil? || line_cmd.strip.empty?
         recursive = force || recursive_make_cmd?(line_cmd, vars)
         force = true if recursive
         exec_cmd = with_makelevel(line_cmd, vars, recursive)
-        exec_cmd = apply_recipe_exports(exec_cmd, vars)
+        exec_cmd = apply_recipe_exports(exec_cmd, vars, recursive)
         if @dry_run && !force
           puts line_cmd
           ran = true
           next
         end
-        puts line_cmd unless silent || @silent
+        if @dry_run && force
+          puts line_cmd unless @silent
+        else
+          puts line_cmd unless silent || @silent
+        end
         ok, status = run_command(exec_cmd)
         unless ok
           if ignore_fail
@@ -68,12 +78,13 @@ module RMake
           silent, ignore_fail, force, line_cmd = Util.strip_cmd_prefixes(line.to_s)
           silent ||= base_silent
           ignore_fail ||= base_ignore
+          ignore_fail ||= @ignore_errors
           force ||= base_force
           next if line_cmd.nil? || line_cmd.strip.empty?
           recursive = force || recursive_make_cmd?(line_cmd, vars)
           force = true if recursive
           exec_cmd = with_makelevel(line_cmd, vars, recursive)
-          exec_cmd = apply_recipe_exports(exec_cmd, vars)
+          exec_cmd = apply_recipe_exports(exec_cmd, vars, recursive)
           prepared << [line_cmd, exec_cmd, silent, ignore_fail, force, expand_ctx]
         end
       end
@@ -85,7 +96,11 @@ module RMake
           ran = true
           next
         end
-        puts line_cmd unless silent || @silent
+        if @dry_run && force
+          puts line_cmd unless @silent
+        else
+          puts line_cmd unless silent || @silent
+        end
         ok, status = run_command(exec_cmd)
         unless ok
           if ignore_fail
@@ -116,7 +131,7 @@ module RMake
         recursive = force || recursive_make_cmd?(expanded, vars)
         force = true if recursive
         exec_cmd = with_makelevel(expanded, vars, recursive)
-        exec_cmd = apply_recipe_exports(exec_cmd, vars)
+        exec_cmd = apply_recipe_exports(exec_cmd, vars, recursive)
         if @dry_run && !force
           puts expanded
           next
@@ -182,9 +197,11 @@ module RMake
       end
       make_cmd = var_value(vars, "MAKE") if (make_cmd.nil? || make_cmd.empty?) && vars
       return cmd if make_cmd.nil? || make_cmd.empty?
-      assign = recursive_make_assignments(vars)
+      assign = recursive_make_assignments(vars, cmd)
       return cmd if assign.empty?
       inject = "env #{assign} #{make_cmd}"
+      extra_args = recursive_make_extra_args(vars, cmd)
+      inject += " #{extra_args}" unless extra_args.empty?
       stripped = cmd.lstrip
       if stripped.start_with?(make_cmd)
         lead = cmd[0...(cmd.length - stripped.length)]
@@ -199,7 +216,7 @@ module RMake
       before + inject + after
     end
 
-    def recursive_make_assignments(vars)
+    def recursive_make_assignments(vars, cmd = nil)
       current = nil
       if Object.const_defined?(:ENV)
         current = ENV["MAKELEVEL"]
@@ -207,16 +224,42 @@ module RMake
       current = var_value(vars, "MAKELEVEL") if (current.nil? || current.empty?) && vars
       level = current ? current.to_i + 1 : 1
       parts = ["MAKELEVEL=#{level}"]
+      cmd_s = cmd.to_s
+      override_makeflags = cmd_s.include?("MAKEFLAGS=")
       flags = nil
       mflags = nil
       if Object.const_defined?(:ENV)
         flags = ENV["MAKEFLAGS"]
         mflags = ENV["MFLAGS"]
       end
-      flags = var_value(vars, "MAKEFLAGS") if (flags.nil? || flags.empty?) && vars
-      parts << "MAKEFLAGS=#{Util.shell_escape(flags)}" if flags && !flags.empty?
-      mflags = var_value(vars, "MFLAGS") if (mflags.nil? || mflags.empty?) && vars
-      parts << "MFLAGS=#{Util.shell_escape(mflags)}" if mflags && !mflags.empty?
+      unless override_makeflags
+        flags = var_value(vars, "MAKEFLAGS") if (flags.nil? || flags.empty?) && vars
+        parts << "MAKEFLAGS=#{Util.shell_escape(flags)}" if flags && !flags.empty?
+        mflags = var_value(vars, "MFLAGS") if (mflags.nil? || mflags.empty?) && vars
+        parts << "MFLAGS=#{Util.shell_escape(mflags)}" if mflags && !mflags.empty?
+      end
+      parts.join(" ")
+    end
+
+    def recursive_make_extra_args(vars, cmd = nil)
+      parts = []
+      env_override = var_value(vars, "__RMAKE_ENV_OVERRIDE__")
+      if (env_override.nil? || env_override.empty?) && Object.const_defined?(:ENV)
+        env_override = ENV["__RMAKE_ENV_OVERRIDE__"]
+      end
+      if env_override == "1"
+        cmd_s = cmd.to_s
+        parts << "-e" unless cmd_s.include?("MAKEFLAGS=")
+      end
+
+      cli_assigns = var_value(vars, "__RMAKE_CLI_ASSIGNS_ESC")
+      if (cli_assigns.nil? || cli_assigns.empty?) && vars
+        cli_assigns = var_value(vars, "__RMAKE_CLI_ASSIGNS_ESC__")
+      end
+      if (cli_assigns.nil? || cli_assigns.empty?) && Object.const_defined?(:ENV)
+        cli_assigns = ENV["__RMAKE_CLI_ASSIGNS_ESC"]
+      end
+      parts << cli_assigns if cli_assigns && !cli_assigns.empty?
       parts.join(" ")
     end
 
@@ -226,8 +269,9 @@ module RMake
       var.simple ? var.value.to_s : Util.expand(var.value.to_s, vars, {})
     end
 
-    def apply_recipe_exports(cmd, vars)
+    def apply_recipe_exports(cmd, vars, recursive = false)
       return cmd if vars.nil?
+      suppress_makeflags = recursive && cmd.to_s.include?("MAKEFLAGS=")
       exports = var_value(vars, "__RMAKE_EXPORTS__")
       names = []
       names.concat(Util.split_ws(exports)) if exports && !exports.empty?
@@ -235,8 +279,13 @@ module RMake
       if env_keys && !env_keys.empty?
         Util.split_ws(env_keys).each do |name|
           next if name.nil? || name.empty?
+          next if suppress_makeflags && (name == "MAKEFLAGS" || name == "MFLAGS")
           names << name if vars[name]
         end
+      end
+      %w[MAKE MAKEFLAGS MFLAGS MAKELEVEL MAKECMDGOALS].each do |name|
+        next if suppress_makeflags && (name == "MAKEFLAGS" || name == "MFLAGS")
+        names << name if vars[name]
       end
       seen = {}
       names = names.reject do |name|

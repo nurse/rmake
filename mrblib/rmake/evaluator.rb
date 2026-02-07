@@ -52,6 +52,9 @@ module RMake
       @current_file = nil
       @current_line = nil
       @call_ctx = nil
+      @no_builtin_rules = false
+      @no_builtin_variables = false
+      @include_dirs = []
       seed_env
     end
 
@@ -204,7 +207,7 @@ module RMake
               @rules << rule_obj
             end
           end
-          if inline && !inline.strip.empty?
+          if !inline.nil?
             recipe = Util.attach_location(Util.strip_leading_ws(inline), line.filename, line.lineno)
             current_rules.each { |rule_obj| rule_obj.recipe << recipe }
           end
@@ -288,6 +291,7 @@ module RMake
         assigned = true
       end
       @origins[name] = "command line" if assigned
+      apply_makeflags_side_effects if assigned && (name == "MAKEFLAGS" || name == "MFLAGS")
     end
 
     def merge!(ev)
@@ -345,6 +349,30 @@ module RMake
       @origins[name] = origin
     end
 
+    def set_no_builtin_rules(flag)
+      @no_builtin_rules = !!flag
+    end
+
+    def no_builtin_rules?
+      @no_builtin_rules
+    end
+
+    def set_no_builtin_variables(flag)
+      on = !!flag
+      return if @no_builtin_variables == on
+      @no_builtin_variables = on
+      clear_builtin_default_vars if on
+      @no_builtin_rules = true if on
+    end
+
+    def no_builtin_variables?
+      @no_builtin_variables
+    end
+
+    def set_include_dirs(dirs)
+      @include_dirs = (dirs || []).map(&:to_s)
+    end
+
     private
 
     def seed_env
@@ -361,6 +389,7 @@ module RMake
       set_special_var("SHELL", shell, "default")
       set_special_var("CC", "cc", "default")
       set_special_var("AR", "ar", "default")
+      set_special_var("TEX", "tex", "default")
     end
 
     def assign_var(name, op, value, force_override = false)
@@ -416,6 +445,7 @@ module RMake
       @make_overrides[name] = true if force_override
       if assigned
         @origins[name] = force_override ? "override" : "file"
+        apply_makeflags_side_effects if name == "MAKEFLAGS" || name == "MFLAGS"
       end
     end
 
@@ -623,14 +653,42 @@ module RMake
       @vars["__RMAKE_EXPORTS__"] = Var.simple(@exports.keys.join(" "))
     end
 
+    def clear_builtin_default_vars
+      %w[CC AR TEX].each do |name|
+        next if @overrides[name] || @make_overrides[name]
+        next unless @origins[name] == "default"
+        @vars.delete(name)
+        @origins.delete(name)
+      end
+    end
+
+    def apply_makeflags_side_effects
+      var = @vars["MAKEFLAGS"] || @vars["MFLAGS"]
+      return unless var
+      raw = var.simple ? var.value.to_s : expand(var.value.to_s, {})
+      flags = Util.split_ws(raw)
+      if flags.any? { |f| f == "-R" || f == "--no-builtin-variables" }
+        set_no_builtin_variables(true)
+      end
+      if flags.any? { |f| f == "-r" || f == "--no-builtin-rules" }
+        set_no_builtin_rules(true)
+      end
+    end
+
     def include_file(path, optional = false)
       return if path.nil? || path.empty?
+      candidate = resolve_include_path(path)
       begin
-        File.open(path, "r") do |io|
+        File.open(candidate, "r") do |io|
           extra = Parser.new(io, path).parse
           Evaluator.new(extra).tap do |ev|
+            ev.set_no_builtin_rules(@no_builtin_rules)
+            ev.set_no_builtin_variables(@no_builtin_variables)
+            ev.set_include_dirs(@include_dirs)
+            ev.vars.clear
             ev.vars.merge!(@vars)
             if ev.instance_variable_defined?(:@origins)
+              ev.instance_variable_get(:@origins).clear
               ev.instance_variable_get(:@origins).merge!(@origins)
             end
             ev.instance_variable_get(:@overrides).merge!(@overrides)
@@ -644,11 +702,26 @@ module RMake
       end
     end
 
+    def resolve_include_path(path)
+      return path if File.exist?(path)
+      return path if path.start_with?("/")
+      @include_dirs.each do |dir|
+        next if dir.nil? || dir.empty?
+        candidate = File.join(dir, path)
+        return candidate if File.exist?(candidate)
+      end
+      path
+    end
+
     def eval_text(text, call_ctx = nil)
       return if text.nil? || text.empty?
       io = StringIO.new(text)
       extra = Parser.new(io, "<eval>").parse
       Evaluator.new(extra).tap do |ev|
+        ev.set_no_builtin_rules(@no_builtin_rules)
+        ev.set_no_builtin_variables(@no_builtin_variables)
+        ev.set_include_dirs(@include_dirs)
+        ev.vars.clear
         ev.vars.merge!(@vars)
         if call_ctx
           filtered = {}
@@ -660,6 +733,7 @@ module RMake
           ev.instance_variable_set(:@call_ctx, filtered)
         end
         if ev.instance_variable_defined?(:@origins)
+          ev.instance_variable_get(:@origins).clear
           ev.instance_variable_get(:@origins).merge!(@origins)
         end
         ev.instance_variable_get(:@overrides).merge!(@overrides)

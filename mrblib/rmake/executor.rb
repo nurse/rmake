@@ -1,12 +1,23 @@
 module RMake
   class Executor
-    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil)
+    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil, touch = false, what_if = nil)
       @graph = graph
       @shell = shell
       @vars = vars
       @evaluator = evaluator
       @delete_on_error = delete_on_error
       @trace = trace
+      @touch = !!touch
+      @what_if = {}
+      (what_if || []).each do |w|
+        next if w.nil? || w.empty?
+        @what_if[w] = true
+        if w.start_with?("./")
+          @what_if[w[2..-1]] = true
+        else
+          @what_if["./#{w}"] = true
+        end
+      end
       @suffixes = suffixes || []
       @second_expansion = !!second_expansion
       @building = {}
@@ -18,6 +29,7 @@ module RMake
       @built_any = false
       @built_phony = {}
       @restat_no_change = {}
+      @pretend_updated = {}
       seed_precompleted(precompleted)
     end
 
@@ -51,10 +63,17 @@ module RMake
         return true
       end
 
-      if need_build?(node, deps)
+      if need_build?(node, deps, node_vars)
         old_mtime = mtime(node.name)
-        ok, executed = run_recipe(node, deps, node_vars)
+        if @touch && !node.phony
+          ok, executed = touch_target(node)
+        else
+          ok, executed = run_recipe(node, deps, node_vars)
+        end
         @built_any ||= executed
+        if @shell.respond_to?(:dry_run?) && @shell.dry_run? && executed && !node.phony
+          @pretend_updated[node.name] = true
+        end
         unless ok
           cleanup_target(node)
           return false
@@ -107,7 +126,7 @@ module RMake
             next
           end
           deps, = expanded_prereqs(node)
-          if !need_build?(node, deps)
+          if !need_build?(node, deps, node_vars)
             @built_phony[node.name] = true if node.phony
             mark_done(node.name, done, pending, reverse, plan, ready)
             next
@@ -117,13 +136,28 @@ module RMake
           @built_any ||= recipe_executes?(node, deps)
           @building[node.name] = :building
           run_old[node.name] = mtime(node.name)
-          pid = @shell.spawn_recipe(node, node_vars, auto_vars(node, deps))
-          if pid == 0
+          if @touch && !node.phony
+            ok, executed = touch_target(node)
+            @built_any ||= executed
+            if @shell.respond_to?(:dry_run?) && @shell.dry_run? && executed && !node.phony
+              @pretend_updated[node.name] = true
+            end
+            unless ok
+              cleanup_target(node)
+              return false
+            end
             @built_phony[node.name] = true if node.phony
             @building[node.name] = :done
             mark_done(node.name, done, pending, reverse, plan, ready)
           else
-            running[pid] = node
+            pid = @shell.spawn_recipe(node, node_vars, auto_vars(node, deps))
+            if pid == 0
+              @built_phony[node.name] = true if node.phony
+              @building[node.name] = :done
+              mark_done(node.name, done, pending, reverse, plan, ready)
+            else
+              running[pid] = node
+            end
           end
         end
 
@@ -216,7 +250,8 @@ module RMake
       end
 
       seen[node.name] = :done
-      need_build?(node) ? 1 : 0
+      node_vars = vars_for(node, nil)
+      need_build?(node, deps, node_vars) ? 1 : 0
     end
 
     def resolve_node(name)
@@ -234,8 +269,9 @@ module RMake
       end
       imp = nil
       imp_rules = @graph.implicit_rules_for(name)
+      no_builtin_rules = @evaluator && @evaluator.respond_to?(:no_builtin_rules?) && @evaluator.no_builtin_rules?
       if node
-        if node.recipe.nil? || node.recipe.empty?
+        if !no_builtin_rules && (node.recipe.nil? || node.recipe.empty?)
           imp_rules.each do |src, dst, prereqs, recipe|
             base = name[0...-dst.length]
             imp = Graph::Node.new(name, [base + src] + prereqs, [], recipe.dup, false, false, false, {}, {})
@@ -247,7 +283,7 @@ module RMake
             end
           end
         end
-        if node.recipe.nil? || node.recipe.empty?
+        if !no_builtin_rules && (node.recipe.nil? || node.recipe.empty?)
           if name.end_with?(".o")
             base = name[0...-2]
             [".S", ".s"].each do |ext|
@@ -275,7 +311,7 @@ module RMake
         end
       end
       # Built-in implicit for assembly
-      if name.end_with?(".o")
+      if !no_builtin_rules && name.end_with?(".o")
         base = name[0...-2]
         [".S", ".s"].each do |ext|
           src = base + ext
@@ -298,14 +334,16 @@ module RMake
       nil
     end
 
-    def need_build?(node, deps = nil)
+    def need_build?(node, deps = nil, vars_override = nil)
       deps ||= expanded_prereqs(node).first
       if node.phony
         return false if @built_phony[node.name]
         return false if node.recipe.nil? || node.recipe.empty?
+        return false unless @touch || recipe_executes_with_vars?(node, deps, vars_override)
         return true
       end
       return false if node.recipe.nil? || node.recipe.empty?
+      return false unless @touch || recipe_executes_with_vars?(node, deps, vars_override)
       deps.each do |dep|
         dep_node = @graph.node(dep)
         return true if dep_node && dep_node.phony
@@ -314,6 +352,7 @@ module RMake
       return true if tgt_mtime.nil?
 
       deps.any? do |dep|
+        next true if @pretend_updated[dep]
         next false if @restat_no_change[dep]
         path = resolve_path(dep) || dep
         dep_mtime = mtime(path)
@@ -333,6 +372,45 @@ module RMake
         return true unless line.nil? || line.strip.empty?
       end
       false
+    end
+
+    def recipe_executes_with_vars?(node, deps = nil, vars_override = nil)
+      return false if node.recipe.nil? || node.recipe.empty?
+      vars = vars_override || vars_for(node)
+      ctx = auto_vars(node, deps)
+      node.recipe.each do |raw|
+        loc_file, loc_line, recipe_line = Util.extract_location(raw.to_s)
+        expand_ctx = ctx.dup
+        if loc_file && !loc_file.empty?
+          expand_ctx["__file"] = loc_file
+          expand_ctx["__line"] = loc_line
+        end
+        _base_silent, _base_ignore, _base_force, body = Util.strip_cmd_prefixes(recipe_line.to_s)
+        expanded = Util.expand(body, vars, expand_ctx)
+        next if expanded.nil? || expanded.strip.empty?
+        expanded.split("\n", -1).each do |line|
+          _silent, _ignore, _force, line_cmd = Util.strip_cmd_prefixes(line.to_s)
+          return true unless line_cmd.nil? || line_cmd.strip.empty?
+        end
+      end
+      false
+    end
+
+    def touch_target(node)
+      if @shell.respond_to?(:dry_run?) && @shell.dry_run?
+        puts "touch #{node.name}"
+        return [true, true]
+      end
+      begin
+        File.open(node.name, "a") { |_| }
+        if File.respond_to?(:utime)
+          now = Time.now
+          File.utime(now, now, node.name)
+        end
+        [true, true]
+      rescue StandardError
+        [false, true]
+      end
     end
 
     def auto_vars(node, deps = nil)
@@ -444,9 +522,9 @@ module RMake
     def missing_dep_error(target, parent)
       prefix = make_prefix
       msg = if parent && !parent.empty?
-        "#{prefix}: *** No rule to make target `#{target}', needed by `#{parent}'.  Stop."
+        "#{prefix}: *** No rule to make target '#{target}', needed by '#{parent}'.  Stop."
       else
-        "#{prefix}: *** No rule to make target `#{target}'.  Stop."
+        "#{prefix}: *** No rule to make target '#{target}'.  Stop."
       end
       if Kernel.respond_to?(:warn)
         warn msg
@@ -458,12 +536,25 @@ module RMake
 
     def make_prefix
       base = "make"
+      mk_from_vars = nil
+      if @vars
+        v = @vars["MAKE"]
+        if v
+          mk_from_vars = v.simple ? v.value.to_s : Util.expand(v.value.to_s, @vars, {})
+        end
+      end
       if Object.const_defined?(:ENV)
         mk = ENV["MAKE"]
         if mk && !mk.empty?
           token = Util.split_ws(mk).first
           base = File.basename(token) if token && !token.empty?
+        elsif mk_from_vars && !mk_from_vars.empty?
+          token = Util.split_ws(mk_from_vars).first
+          base = File.basename(token) if token && !token.empty?
         end
+      elsif mk_from_vars && !mk_from_vars.empty?
+        token = Util.split_ws(mk_from_vars).first
+        base = File.basename(token) if token && !token.empty?
       end
       level = 0
       if Object.const_defined?(:ENV)
@@ -503,6 +594,10 @@ module RMake
 
     def mtime(path)
       return @mtime_cache[path] if @mtime_cache.key?(path)
+      if @what_if[path]
+        @mtime_cache[path] = 2_147_483_647
+        return @mtime_cache[path]
+      end
       return nil unless File.respond_to?(:exist?) && File.exist?(path)
       if File.respond_to?(:mtime)
         t = File.mtime(path)
