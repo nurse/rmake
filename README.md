@@ -73,6 +73,7 @@ Options:
 ```sh
 ruby test/run.rb
 ruby test/run_gnumake_compat.rb
+ruby test/run_all.rb
 ```
 
 `test/run_gnumake_compat.rb` downloads GNU make's `run_make_tests.pl` at runtime
@@ -84,6 +85,20 @@ Set `RUN_MAKE_TESTS_FETCH=0` to forbid downloads (missing local file then fails)
 
 `tmp/` and `work/` are scratch directories. They are intentionally ignored by git
 and can be removed at any time.
+
+`test/run_all.rb` is the integrated suite runner. It executes:
+
+- local regression tests (`test/run.rb`)
+- gmake micro-compat tests (`test/run_gnumake_compat.rb`)
+- GNU `run_make_tests.pl` selected categories via `test/rmake-make-driver.pl`
+
+Useful env vars:
+
+- `GNU_MAKE_TESTS_DIR=/path/to/make/tests` to use a pre-existing GNU test tree
+- `RMAKE_GNU_TESTS_FETCH=0` to disable automatic clone of GNU make tests
+- `RMAKE_GNU_CATEGORIES=cat1,cat2,...` to run a subset of GNU categories
+- `RMAKE_GNU_PROGRESS_SEC=20` to print periodic progress while GNU categories run
+- `RMAKE_GNU_TIMEOUT=1200` to set timeout seconds for GNU categories step
 
 ## Next
 
