@@ -713,6 +713,11 @@ module RMake
         detected = default_jobs
         opts[:jobs] = detected if detected && detected > 0
       end
+
+      if opts[:load_average] && !opts[:load_average].to_s.empty? && opts[:jobs] > 1
+        # We don't model real system load yet; keep behavior safe and deterministic.
+        opts[:jobs] = 1
+      end
       [opts, jobs_set]
     end
 
