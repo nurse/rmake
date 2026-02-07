@@ -9,7 +9,7 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 
-extern const uint8_t mrake_app[];
+extern const uint8_t rmake_app[];
 
 static void
 set_argv(mrb_state *mrb, int argc, char **argv)
@@ -31,12 +31,12 @@ main(int argc, char **argv)
   int exit_code = 0;
   mrb_state *mrb = mrb_open();
   if (!mrb) {
-    fprintf(stderr, "mrake: failed to initialize mruby\n");
+    fprintf(stderr, "rmake: failed to initialize mruby\n");
     return 1;
   }
 
   set_argv(mrb, argc, argv);
-  mrb_value result = mrb_load_irep(mrb, mrake_app);
+  mrb_value result = mrb_load_irep(mrb, rmake_app);
   if (mrb->exc) {
     mrb_print_error(mrb);
     mrb_close(mrb);

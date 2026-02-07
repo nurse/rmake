@@ -8,11 +8,11 @@ require "shellwords"
 ROOT = File.expand_path("..", __dir__)
 MRUBY_DIR = File.join(ROOT, "mruby")
 DIST_DIR = File.join(ROOT, "dist")
-TMP_DIR = File.join(ROOT, "tmp", "mrake-build")
-MRUBY_CONFIG = File.join(ROOT, "tools", "mrake_mruby_config.rb")
-MAIN_C = File.join(ROOT, "tools", "mrake_main.c")
-BUNDLE_RB = File.join(TMP_DIR, "mrake_bundle.rb")
-BUNDLE_C = File.join(TMP_DIR, "mrake_bundle.c")
+TMP_DIR = File.join(ROOT, "tmp", "rmake-build")
+MRUBY_CONFIG = File.join(ROOT, "tools", "rmake_mruby_config.rb")
+MAIN_C = File.join(ROOT, "tools", "rmake_main.c")
+BUNDLE_RB = File.join(TMP_DIR, "rmake_bundle.rb")
+BUNDLE_C = File.join(TMP_DIR, "rmake_bundle.c")
 MRBC_REL = File.join("build", "host", "mrbc", "bin")
 LIBMRUBY_REL = File.join("build", "host", "lib", "libmruby.a")
 BUILD_INCLUDE_REL = File.join("build", "host", "include")
@@ -66,9 +66,9 @@ def normalized_arch
 end
 
 def output_name
-  tag = ENV["MRAKE_OUT_TAG"].to_s
+  tag = ENV["RMAKE_OUT_TAG"].to_s
   tag = "#{normalized_os}-#{normalized_arch}" if tag.empty?
-  "mrake-#{tag}#{exe_ext}"
+  "rmake-#{tag}#{exe_ext}"
 end
 
 def write_bundle!
@@ -91,7 +91,7 @@ end
 
 def build_mruby!
   env = { "MRUBY_CONFIG" => MRUBY_CONFIG }
-  run!("rake", "clean", chdir: MRUBY_DIR, env: env) if ENV["MRAKE_NO_CLEAN"] != "1"
+  run!("rake", "clean", chdir: MRUBY_DIR, env: env) if ENV["RMAKE_NO_CLEAN"] != "1"
   run!("rake", chdir: MRUBY_DIR, env: env)
 end
 
@@ -107,7 +107,7 @@ def mrbc_path
 end
 
 def compile_irep!
-  run!(mrbc_path, "-B", "mrake_app", "-o", BUNDLE_C, BUNDLE_RB, chdir: ROOT)
+  run!(mrbc_path, "-B", "rmake_app", "-o", BUNDLE_C, BUNDLE_RB, chdir: ROOT)
 end
 
 def compile_binary!
@@ -136,7 +136,7 @@ def compile_binary!
   libs = RbConfig::CONFIG["LIBS"].to_s.split
   args.concat(libs)
   args << "-lm" unless libs.include?("-lm")
-  args.concat(ENV["MRAKE_EXTRA_LDFLAGS"].to_s.split)
+  args.concat(ENV["RMAKE_EXTRA_LDFLAGS"].to_s.split)
 
   run!(*args, chdir: ROOT)
 

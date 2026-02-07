@@ -1,5 +1,5 @@
 MRuby::Build.new("host") do |conf|
-  tool = ENV["MRAKE_TOOLCHAIN"].to_s
+  tool = ENV["RMAKE_TOOLCHAIN"].to_s
   if !tool.empty?
     conf.toolchain tool.to_sym
   elsif RUBY_PLATFORM =~ /darwin/

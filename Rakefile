@@ -62,30 +62,30 @@ desc "Run integrated test suite"
 task test: "test:all"
 
 namespace :build do
-  desc "Build standalone mrake binary into dist/"
-  task :mrake do
-    run_cmd(RUBY, File.join(ROOT, "tools", "build_mrake.rb"))
+  desc "Build standalone rmake binary into dist/"
+  task :rmake do
+    run_cmd(RUBY, File.join(ROOT, "tools", "build_rmake.rb"))
   end
 
-  desc "Build standalone mrake binary without mruby clean"
-  task :mrake_no_clean do
+  desc "Build standalone rmake binary without mruby clean"
+  task :rmake_no_clean do
     run_cmd(
       RUBY,
-      File.join(ROOT, "tools", "build_mrake.rb"),
-      env: { "MRAKE_NO_CLEAN" => "1" }
+      File.join(ROOT, "tools", "build_rmake.rb"),
+      env: { "RMAKE_NO_CLEAN" => "1" }
     )
   end
 end
 
-namespace :mrake do
-  desc "Remove mrake build artifacts"
+namespace :rmake do
+  desc "Remove rmake build artifacts"
   task :clean do
     FileUtils.rm_rf(File.join(ROOT, "dist"))
-    FileUtils.rm_rf(File.join(ROOT, "tmp", "mrake-build"))
+    FileUtils.rm_rf(File.join(ROOT, "tmp", "rmake-build"))
   end
 end
 
-desc "Build standalone mrake binary"
-task build: "build:mrake"
+desc "Build standalone rmake binary"
+task build: "build:rmake"
 
 task default: :test

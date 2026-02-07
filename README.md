@@ -34,9 +34,9 @@ Main tasks:
 - `rake test:unit`
 - `rake test:micro`
 - `rake test:gnu`
-- `rake build` (same as `rake build:mrake`)
-- `rake build:mrake_no_clean`
-- `rake mrake:clean`
+- `rake build` (same as `rake build:rmake`)
+- `rake build:rmake_no_clean`
+- `rake rmake:clean`
 
 ### Build mruby
 
@@ -62,25 +62,25 @@ Options:
 - `-q`      Question mode (exit 0/1/2 without running recipes)
 - `-d`      Trace target evaluation and skips
 
-## Single Binary (mrake)
+## Single Binary (rmake)
 
-Build a standalone `mrake` binary (contains mruby + rmake bytecode):
+Build a standalone `rmake` binary (contains mruby + rmake bytecode):
 
 ```sh
-rake build:mrake
+rake build:rmake
 ```
 
 Output:
 
-- `dist/mrake-<os>-<arch>` (or `.exe` on Windows)
+- `dist/rmake-<os>-<arch>` (or `.exe` on Windows)
 
 Optional env vars:
 
-- `MRAKE_NO_CLEAN=1` skip `mruby` clean before build
-- `MRAKE_OUT_TAG=<tag>` override output suffix
+- `RMAKE_NO_CLEAN=1` skip `mruby` clean before build
+- `RMAKE_OUT_TAG=<tag>` override output suffix
 - `CC=<compiler>` override C compiler for launcher link
-- `MRAKE_EXTRA_LDFLAGS="..."` extra linker flags
-- `MRAKE_TOOLCHAIN=<toolchain>` force mruby toolchain (`gcc`, `clang`, etc)
+- `RMAKE_EXTRA_LDFLAGS="..."` extra linker flags
+- `RMAKE_TOOLCHAIN=<toolchain>` force mruby toolchain (`gcc`, `clang`, etc)
 
 ## Status
 
@@ -138,7 +138,7 @@ Useful env vars:
 
 ## CI Artifacts
 
-`.github/workflows/build-mrake.yml` builds `mrake` artifacts for:
+`.github/workflows/build-rmake.yml` builds `rmake` artifacts for:
 
 - Linux x86_64
 - macOS x86_64

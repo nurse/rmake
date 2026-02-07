@@ -1,4 +1,4 @@
-name: Build mrake
+name: Build rmake
 
 on:
   workflow_dispatch:
@@ -32,14 +32,14 @@ jobs:
         with:
           ruby-version: "3.2"
 
-      - name: Build mrake
+      - name: Build rmake
         shell: bash
         run: |
-          ruby tools/build_mrake.rb
+          ruby tools/build_rmake.rb
           ls -la dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mrake-${{ matrix.artifact }}
-          path: dist/mrake-*
+          name: rmake-${{ matrix.artifact }}
+          path: dist/rmake-*
