@@ -155,8 +155,19 @@ def ensure_config_flags(tests_dir)
 end
 
 def run_all
-  run_step("unit/regression tests", ["ruby", File.join(TEST_DIR, "run.rb")], chdir: ROOT)
-  run_step("gmake micro compatibility tests", ["ruby", File.join(TEST_DIR, "run_gnumake_compat.rb")], chdir: ROOT)
+  run_unit = ENV.fetch("RMAKE_RUN_UNIT", "1") != "0"
+  run_micro = ENV.fetch("RMAKE_RUN_GMAKE_COMPAT", "1") != "0"
+  run_gnu = ENV.fetch("RMAKE_RUN_GNU", "1") != "0"
+
+  unless run_unit || run_micro || run_gnu
+    warn "FAIL: all test sections are disabled"
+    exit 1
+  end
+
+  run_step("unit/regression tests", ["ruby", File.join(TEST_DIR, "run.rb")], chdir: ROOT) if run_unit
+  run_step("gmake micro compatibility tests", ["ruby", File.join(TEST_DIR, "run_gnumake_compat.rb")], chdir: ROOT) if run_micro
+
+  return unless run_gnu
 
   tests_dir = ensure_gnu_tests_tree
   ensure_config_flags(tests_dir)

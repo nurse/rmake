@@ -20,6 +20,24 @@ This is a mruby gem-style layout.
 - `mrblib/` contains the mruby sources.
 - `tools/rmake` is the CLI entrypoint (invoked via `mruby tools/rmake`).
 
+## Rake Tasks
+
+Use the top-level `Rakefile` for both tests and packaging:
+
+```sh
+rake -T
+```
+
+Main tasks:
+
+- `rake test` (same as `rake test:all`)
+- `rake test:unit`
+- `rake test:micro`
+- `rake test:gnu`
+- `rake build` (same as `rake build:mrake`)
+- `rake build:mrake_no_clean`
+- `rake mrake:clean`
+
 ### Build mruby
 
 `rmake` ships a local mruby build under `mruby/` and includes `mruby-file-stat` for fast `File.mtime`.
@@ -43,6 +61,26 @@ Options:
 - `-n`      Dry-run (print commands without running)
 - `-q`      Question mode (exit 0/1/2 without running recipes)
 - `-d`      Trace target evaluation and skips
+
+## Single Binary (mrake)
+
+Build a standalone `mrake` binary (contains mruby + rmake bytecode):
+
+```sh
+rake build:mrake
+```
+
+Output:
+
+- `dist/mrake-<os>-<arch>` (or `.exe` on Windows)
+
+Optional env vars:
+
+- `MRAKE_NO_CLEAN=1` skip `mruby` clean before build
+- `MRAKE_OUT_TAG=<tag>` override output suffix
+- `CC=<compiler>` override C compiler for launcher link
+- `MRAKE_EXTRA_LDFLAGS="..."` extra linker flags
+- `MRAKE_TOOLCHAIN=<toolchain>` force mruby toolchain (`gcc`, `clang`, etc)
 
 ## Status
 
@@ -71,9 +109,7 @@ Options:
 ## Tests
 
 ```sh
-ruby test/run.rb
-ruby test/run_gnumake_compat.rb
-ruby test/run_all.rb
+rake test
 ```
 
 `test/run_gnumake_compat.rb` downloads GNU make's `run_make_tests.pl` at runtime
@@ -99,6 +135,15 @@ Useful env vars:
 - `RMAKE_GNU_CATEGORIES=cat1,cat2,...` to run a subset of GNU categories
 - `RMAKE_GNU_PROGRESS_SEC=20` to print periodic progress while GNU categories run
 - `RMAKE_GNU_TIMEOUT=1200` to set timeout seconds for GNU categories step
+
+## CI Artifacts
+
+`.github/workflows/build-mrake.yml` builds `mrake` artifacts for:
+
+- Linux x86_64
+- macOS x86_64
+- macOS arm64
+- Windows x86_64
 
 ## Next
 

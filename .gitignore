@@ -8,3 +8,5 @@ mruby/bin/
 *.tmp
 tmp/
 work/
+dist/
+tools/*.lock
