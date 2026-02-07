@@ -1,7 +1,8 @@
 module RMake
   class Shell
-    def initialize(dry_run = false)
+    def initialize(dry_run = false, silent = false)
       @dry_run = dry_run
+      @silent = silent
     end
 
     def self.supports_spawn?
@@ -10,22 +11,37 @@ module RMake
 
     def run(cmd, vars, env_vars = nil)
       env_vars ||= {}
-      expanded = Util.expand(cmd, vars, env_vars)
-      silent, ignore_fail, force, expanded = Util.strip_cmd_prefixes(expanded)
-      recursive = force || recursive_make_cmd?(expanded, vars)
-      force = true if recursive
-      exec_cmd = with_makelevel(expanded, vars, recursive)
-      if @dry_run && !force
-        puts expanded
-        return true
+      base_silent, base_ignore, base_force, body = Util.strip_cmd_prefixes(cmd.to_s)
+      expanded = Util.expand(body, vars, env_vars)
+      return [true, false] if expanded.nil? || expanded.strip.empty?
+      ran = false
+      expanded.split("\n", -1).each do |line|
+        silent, ignore_fail, force, line_cmd = Util.strip_cmd_prefixes(line.to_s)
+        silent ||= base_silent
+        ignore_fail ||= base_ignore
+        force ||= base_force
+        next if line_cmd.nil? || line_cmd.strip.empty?
+        recursive = force || recursive_make_cmd?(line_cmd, vars)
+        force = true if recursive
+        exec_cmd = with_makelevel(line_cmd, vars, recursive)
+        if @dry_run && !force
+          puts line_cmd
+          ran = true
+          next
+        end
+        puts line_cmd unless silent || @silent
+        ok, status = run_command(exec_cmd)
+        unless ok
+          if ignore_fail
+            emit_ignored_error(env_vars, status, vars)
+            ran = true
+            next
+          end
+          return [false, true]
+        end
+        ran = true
       end
-      puts expanded unless silent
-
-      ok, status = run_command(exec_cmd)
-      if ignore_fail && !ok
-        emit_ignored_error(env_vars, status, vars)
-      end
-      ok || ignore_fail
+      [true, ran]
     end
 
     def spawn_recipe(node, vars, env_vars = nil)
@@ -34,6 +50,7 @@ module RMake
       node.recipe.each do |raw|
         expanded = Util.expand(raw, vars, env_vars)
         silent, ignore_fail, force, expanded = Util.strip_cmd_prefixes(expanded)
+        next if expanded.nil? || expanded.strip.empty?
         recursive = force || recursive_make_cmd?(expanded, vars)
         force = true if recursive
         exec_cmd = with_makelevel(expanded, vars, recursive)
@@ -41,7 +58,7 @@ module RMake
           puts expanded
           next
         end
-        script << "echo #{escape_sh(expanded)}\n" unless silent
+        script << "echo #{escape_sh(expanded)}\n" unless silent || @silent
         if ignore_fail
           prefix = ignored_error_prefix(env_vars, vars).gsub("\"", "\\\"")
           script << "if /bin/sh -c #{escape_sh(exec_cmd)}; then :; else __rmake_status=$?; "
@@ -191,6 +208,14 @@ module RMake
       end
       label = target ? "[#{target}]" : ""
       prefix = "make"
+      mk = nil
+      if Object.const_defined?(:ENV)
+        mk = ENV["MAKE"]
+      end
+      if mk && !mk.empty?
+        token = Util.split_ws(mk).first
+        prefix = File.basename(token) if token && !token.empty?
+      end
       level = nil
       if Object.const_defined?(:ENV) && ENV["MAKELEVEL"]
         level = ENV["MAKELEVEL"].to_i
@@ -199,7 +224,7 @@ module RMake
         val = vars["MAKELEVEL"]
         level = val.simple ? val.value.to_i : Util.expand(val.value.to_s, vars, {}).to_i
       end
-      prefix = "make[#{level}]" if level && level > 0
+      prefix = "#{prefix}[#{level}]" if level && level > 0
       if label.empty?
         "#{prefix}: Error "
       else

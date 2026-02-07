@@ -1,26 +1,30 @@
 module RMake
   class Executor
-    def initialize(graph, shell, vars, delete_on_error = false, trace = false)
+    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false)
       @graph = graph
       @shell = shell
       @vars = vars
       @delete_on_error = delete_on_error
       @trace = trace
+      @suffixes = suffixes || []
+      @second_expansion = !!second_expansion
       @building = {}
       @mtime_cache = {}
       @resolve_cache = {}
       @node_cache = {}
+      @expanded_prereq_cache = {}
       @vpath_dirs = nil
       @built_any = false
       @built_phony = {}
       @restat_no_change = {}
+      seed_precompleted(precompleted)
     end
 
     def built_any?
       @built_any
     end
 
-    def build(target, parent = nil)
+    def build(target, parent = nil, inherited = nil)
       node = resolve_node(target)
       unless node
         return true if file_present?(target)
@@ -35,8 +39,10 @@ module RMake
       @building[key] = :building
       puts "rmake: #{target}" if @trace
 
-      node.deps.each { |dep| return false unless build(dep, node.name) }
-      node.order_only.each { |dep| return false unless build(dep, node.name) }
+      node_vars = vars_for(node, inherited)
+      deps, order_only = expanded_prereqs(node)
+      deps.each { |dep| return false unless build(dep, node.name, node_vars) }
+      order_only.each { |dep| return false unless build(dep, node.name, node_vars) }
 
       if node.phony && (node.recipe.nil? || node.recipe.empty?)
         @built_phony[key] = true
@@ -44,10 +50,10 @@ module RMake
         return true
       end
 
-      if need_build?(node)
+      if need_build?(node, deps)
         old_mtime = mtime(node.name)
-        @built_any = true
-        ok = run_recipe(node)
+        ok, executed = run_recipe(node, deps, node_vars)
+        @built_any ||= executed
         unless ok
           cleanup_target(node)
           return false
@@ -68,6 +74,7 @@ module RMake
       return false unless validate_deps(target, nil, {})
       plan = collect_targets(target)
       return true if plan.empty?
+      inherited = inherited_vars_for_plan(target)
 
       reverse = {}
       pending = {}
@@ -77,7 +84,8 @@ module RMake
       run_old = {}
 
       plan.each do |name, node|
-        deps = node.deps + node.order_only
+        deps, order_only = expanded_prereqs(node)
+        deps = deps + order_only
         wait_deps = deps.select { |dep| plan.key?(dep) }
         pending[name] = wait_deps.length
         wait_deps.each do |dep|
@@ -92,21 +100,23 @@ module RMake
       while done.length < plan.length
         while ready.any? && running.length < jobs
           node = ready.shift
+          node_vars = vars_for(node, inherited[node.name])
           if @built_phony[node.name] || @building[node.name] == :done
             mark_done(node.name, done, pending, reverse, plan, ready)
             next
           end
-          if !need_build?(node)
+          deps, = expanded_prereqs(node)
+          if !need_build?(node, deps)
             @built_phony[node.name] = true if node.phony
             mark_done(node.name, done, pending, reverse, plan, ready)
             next
           end
 
           puts "rmake: #{node.name}" if @trace
-          @built_any = true
+          @built_any ||= recipe_executes?(node, deps)
           @building[node.name] = :building
           run_old[node.name] = mtime(node.name)
-          pid = @shell.spawn_recipe(node, vars_for(node), auto_vars(node))
+          pid = @shell.spawn_recipe(node, node_vars, auto_vars(node, deps))
           if pid == 0
             @built_phony[node.name] = true if node.phony
             @building[node.name] = :done
@@ -138,6 +148,27 @@ module RMake
       true
     end
 
+    def inherited_vars_for_plan(target)
+      out = {}
+      seed_inherited_vars(target, nil, out, {})
+      out
+    end
+
+    def seed_inherited_vars(target, inherited, out, seen)
+      node = resolve_node(target)
+      return unless node
+      return if seen[node.name]
+      seen[node.name] = true
+      node_vars = vars_for(node, inherited)
+      deps, order_only = expanded_prereqs(node)
+      (deps + order_only).each do |dep|
+        dep_node = resolve_node(dep)
+        next unless dep_node
+        out[dep_node.name] ||= node_vars
+        seed_inherited_vars(dep_node.name, out[dep_node.name], out, seen)
+      end
+    end
+
     def can_build?(target)
       !!resolve_node(target)
     end
@@ -148,7 +179,44 @@ module RMake
       need_build?(node)
     end
 
+    def question_status(target)
+      question_node(target, nil, {})
+    end
+
     private
+
+    def question_node(target, parent, seen)
+      node = resolve_node(target)
+      unless node
+        return 0 if file_present?(target)
+        missing_dep_error(target, parent)
+        return 2
+      end
+
+      mark = seen[node.name]
+      return 0 if mark == :done
+      return 0 if mark == :visiting
+      seen[node.name] = :visiting
+
+      deps, order_only = expanded_prereqs(node)
+      deps = deps + order_only
+      deps.each do |dep|
+        dep_node = resolve_node(dep)
+        if dep_node
+          st = question_node(dep, node.name, seen)
+          return st if st != 0
+          next
+        end
+        path = resolve_path(dep) || dep
+        unless File.exist?(path)
+          missing_dep_error(dep, node.name)
+          return 2
+        end
+      end
+
+      seen[node.name] = :done
+      need_build?(node) ? 1 : 0
+    end
 
     def resolve_node(name)
       cached = @node_cache[name]
@@ -169,7 +237,7 @@ module RMake
         if node.recipe.nil? || node.recipe.empty?
           imp_rules.each do |src, dst, prereqs, recipe|
             base = name[0...-dst.length]
-            imp = Graph::Node.new(name, [base + src] + prereqs, [], recipe.dup, false, false, false, {})
+            imp = Graph::Node.new(name, [base + src] + prereqs, [], recipe.dup, false, false, false, {}, {})
             src_path = imp.deps.first
             if src_path && (File.exist?(src_path) || resolve_path(src_path) || graph_has_node?(src_path))
               node.deps = (imp.deps + node.deps).uniq
@@ -198,7 +266,7 @@ module RMake
       end
       imp_rules.each do |src, dst, prereqs, recipe|
         base = name[0...-dst.length]
-        imp = Graph::Node.new(name, [base + src] + prereqs, [], recipe.dup, false, false, false, {})
+        imp = Graph::Node.new(name, [base + src] + prereqs, [], recipe.dup, false, false, false, {}, {})
         src_path = imp.deps.first
         if src_path && (File.exist?(src_path) || resolve_path(src_path) || graph_has_node?(src_path))
           @node_cache[name] = imp
@@ -214,68 +282,124 @@ module RMake
             recipe = [
               "$(Q) $(CC) $(CFLAGS) $(XCFLAGS) $(CPPFLAGS) $(COUTFLAG)$@ -c $<",
             ]
-            node = Graph::Node.new(name, [src], [], recipe, false, false, false, {})
+            node = Graph::Node.new(name, [src], [], recipe, false, false, false, {}, {})
             @node_cache[name] = node
             return node
           end
         end
       end
+      default_node = @graph.node(".DEFAULT")
+      if default_node && default_node.recipe && !default_node.recipe.empty? && name != ".DEFAULT"
+        node = Graph::Node.new(name, [], [], default_node.recipe.dup, false, false, default_node.double_colon, {}, {})
+        @node_cache[name] = node
+        return node
+      end
       nil
     end
 
-    def need_build?(node)
+    def need_build?(node, deps = nil)
+      deps ||= expanded_prereqs(node).first
       if node.phony
         return false if @built_phony[node.name]
         return false if node.recipe.nil? || node.recipe.empty?
         return true
       end
       return false if node.recipe.nil? || node.recipe.empty?
-      node.deps.each do |dep|
+      deps.each do |dep|
         dep_node = @graph.node(dep)
         return true if dep_node && dep_node.phony
       end
       tgt_mtime = mtime(node.name)
       return true if tgt_mtime.nil?
 
-      node.deps.any? do |dep|
+      deps.any? do |dep|
         next false if @restat_no_change[dep]
         path = resolve_path(dep) || dep
-        (mtime(path) || 0) > tgt_mtime
+        dep_mtime = mtime(path)
+        dep_mtime.nil? || dep_mtime > tgt_mtime
       end
     end
 
-    def run_recipe(node)
-      ctx = auto_vars(node)
-      vars = vars_for(node)
+    def run_recipe(node, deps = nil, vars_override = nil)
+      ctx = auto_vars(node, deps)
+      vars = vars_override || vars_for(node)
+      executed = false
       node.recipe.each do |raw|
-        ok = @shell.run(raw, vars, ctx)
-        return false unless ok
+        ok, did_run = @shell.run(raw, vars, ctx)
+        executed ||= did_run
+        return [false, executed] unless ok
       end
-      true
+      [true, executed]
     end
 
-    def auto_vars(node)
-      prereqs = node.deps.map { |d| resolve_path(d) || d }
+    def recipe_executes?(node, deps = nil)
+      node.recipe.each do |raw|
+        _silent, _ignore, _force, line = Util.strip_cmd_prefixes(raw.to_s)
+        return true unless line.nil? || line.strip.empty?
+      end
+      false
+    end
+
+    def auto_vars(node, deps = nil)
+      deps ||= expanded_prereqs(node).first
+      prereqs = deps.map { |d| resolve_path(d) || d }
       first = prereqs.first || ""
-      stem = Util.strip_suffix(node.name)
-      stem_dir = File.dirname(stem)
-      stem_dir = "." if stem_dir == "."
+      stem = target_stem(node.name)
+      stem_dir = dirpart(stem)
+      uniq_prereqs = uniq_words(prereqs)
+      tgt_mtime = mtime(node.name)
+      newer = prereqs.select do |path|
+        dep_mtime = mtime(path)
+        tgt_mtime.nil? || dep_mtime.nil? || dep_mtime > tgt_mtime
+      end
+      newer = uniq_words(newer)
       {
         "@" => node.name,
         "<" => first,
-        "?" => prereqs.join(" "),
-        "^" => prereqs.join(" "),
+        "<D" => dirpart(first),
+        "<F" => File.basename(first),
+        "?" => newer.join(" "),
+        "?D" => newer.map { |w| dirpart(w) }.join(" "),
+        "?F" => newer.map { |w| File.basename(w) }.join(" "),
+        "^" => uniq_prereqs.join(" "),
+        "^D" => uniq_prereqs.map { |w| dirpart(w) }.join(" "),
+        "^F" => uniq_prereqs.map { |w| File.basename(w) }.join(" "),
+        "+" => prereqs.join(" "),
+        "+D" => prereqs.map { |w| dirpart(w) }.join(" "),
+        "+F" => prereqs.map { |w| File.basename(w) }.join(" "),
         "*" => stem,
         "*F" => File.basename(stem),
         "*D" => stem_dir,
         "@F" => File.basename(node.name),
-        "@D" => File.dirname(node.name) == "." ? "." : File.dirname(node.name),
+        "@D" => dirpart(node.name),
       }
     end
 
-    def vars_for(node)
-      return @vars if node.nil? || node.target_vars.nil? || node.target_vars.empty?
-      @vars.merge(node.target_vars)
+    def vars_for(node, inherited = nil)
+      base = inherited || @vars
+      return base if node.nil? || node.target_vars.nil? || node.target_vars.empty?
+      out = base.dup
+      inherit_append = node.target_inherit_append || {}
+      node.target_vars.each do |name, var|
+        if inherit_append[name]
+          left = out[name]
+          left_s = if left
+            left.simple ? left.value.to_s : Util.expand(left.value.to_s, out, {})
+          else
+            ""
+          end
+          right_s = if var
+            var.simple ? var.value.to_s : Util.expand(var.value.to_s, out, {})
+          else
+            ""
+          end
+          joined = left_s.empty? ? right_s : "#{left_s} #{right_s}"
+          out[name] = Evaluator::Var.simple(joined)
+        else
+          out[name] = var
+        end
+      end
+      out
     end
 
     def resolve_path(path)
@@ -337,6 +461,14 @@ module RMake
     end
 
     def make_prefix
+      base = "make"
+      if Object.const_defined?(:ENV)
+        mk = ENV["MAKE"]
+        if mk && !mk.empty?
+          token = Util.split_ws(mk).first
+          base = File.basename(token) if token && !token.empty?
+        end
+      end
       level = 0
       if Object.const_defined?(:ENV)
         lvl = ENV["MAKELEVEL"]
@@ -348,7 +480,7 @@ module RMake
           level = var.simple ? var.value.to_i : Util.expand(var.value.to_s, @vars, {}).to_i
         end
       end
-      level > 0 ? "make[#{level}]" : "make"
+      level > 0 ? "#{base}[#{level}]" : base
     end
 
     def validate_deps(target, parent, seen)
@@ -359,8 +491,9 @@ module RMake
         return true if file_present?(target)
         return missing_dep_error(target, parent)
       end
-      node.deps.each { |dep| return false unless validate_deps(dep, node.name, seen) }
-      node.order_only.each { |dep| return false unless validate_deps(dep, node.name, seen) }
+      deps, order_only = expanded_prereqs(node)
+      deps.each { |dep| return false unless validate_deps(dep, node.name, seen) }
+      order_only.each { |dep| return false unless validate_deps(dep, node.name, seen) }
       true
     end
 
@@ -429,7 +562,8 @@ module RMake
         node = resolve_node(name)
         next unless node
         plan[name] ||= node
-        (node.deps + node.order_only).each do |dep|
+        deps, order_only = expanded_prereqs(node)
+        (deps + order_only).each do |dep|
           next if plan.key?(dep)
           stack << dep
         end
@@ -483,7 +617,8 @@ module RMake
       stack[name] = true
       node = plan[name]
       if node
-        deps = node.deps + node.order_only
+        deps, order_only = expanded_prereqs(node)
+        deps = deps + order_only
         deps.each do |dep|
           next unless plan.key?(dep)
           next if done[dep]
@@ -519,6 +654,87 @@ module RMake
         @restat_no_change.delete("./#{name}")
         if name.start_with?("./")
           @restat_no_change.delete(name[2..-1])
+        end
+      end
+    end
+
+    def expanded_prereqs(node)
+      cached = @expanded_prereq_cache[node.name]
+      return cached if cached
+
+      ctx = prereq_expand_ctx(node)
+      deps = expand_prereq_words(node.deps, ctx)
+      order_only = expand_prereq_words(node.order_only, ctx)
+      packed = [deps, order_only]
+      @expanded_prereq_cache[node.name] = packed
+      packed
+    end
+
+    def prereq_expand_ctx(node)
+      stem = target_stem(node.name)
+      {
+        "@" => node.name,
+        "@D" => dirpart(node.name),
+        "@F" => File.basename(node.name),
+        "*" => stem,
+        "*D" => dirpart(stem),
+        "*F" => File.basename(stem),
+      }
+    end
+
+    def expand_prereq_words(words, ctx)
+      out = []
+      words.each do |word|
+        expanded = word
+        if @second_expansion && word && word.index("$")
+          expanded = Util.expand(word.to_s, @vars, ctx)
+        end
+        expanded_words = Util.filter_prereq_words(Util.split_ws(expanded.to_s).reject(&:empty?))
+        expanded_words.each do |w|
+          n = Util.normalize_path(Util.normalize_brace_path(w))
+          out << n unless n.nil? || n.empty?
+        end
+      end
+      out
+    end
+
+    def uniq_words(words)
+      out = []
+      seen = {}
+      words.each do |w|
+        next if seen[w]
+        seen[w] = true
+        out << w
+      end
+      out
+    end
+
+    def dirpart(path)
+      d = File.dirname(path.to_s)
+      d.nil? || d.empty? ? "." : d
+    end
+
+    def target_stem(name)
+      return "" if name.nil? || name.empty?
+      return "" if @suffixes.nil? || @suffixes.empty?
+      matched = nil
+      @suffixes.each do |suf|
+        next if suf.nil? || suf.empty?
+        next unless name.end_with?(suf)
+        matched = suf if matched.nil? || suf.length > matched.length
+      end
+      return "" if matched.nil?
+      name[0...-matched.length]
+    end
+
+    def seed_precompleted(precompleted)
+      return if precompleted.nil?
+      precompleted.each_key do |name|
+        @building[name] = :done
+        if name.start_with?("./")
+          @building[name[2..-1]] = :done
+        else
+          @building["./#{name}"] = :done
         end
       end
     end

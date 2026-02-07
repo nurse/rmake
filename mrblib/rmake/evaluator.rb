@@ -15,30 +15,44 @@ module RMake
   end
 
   class Evaluator
+    class MakeError < StandardError; end
+
     Rule = Struct.new(:targets, :prereqs, :order_only, :recipe, :double_colon)
 
-    attr_reader :rules, :vars, :target_vars
+    attr_reader :rules, :vars, :target_vars, :target_pattern_vars
+    attr_reader :target_inherit_append
     attr_reader :includes, :missing_required
+    attr_reader :suffixes
 
     def initialize(lines)
       @lines = lines
       @rules = []
       @vars = {}
       @overrides = {}
+      @make_overrides = {}
       @includes = []
       @missing_required = []
       @suffix_rules = []
       @suffixes = []
+      @second_expansion = false
+      @env_override = false
       @delete_on_error = false
       @precious = {}
       @phony = {}
       @target_vars = {}
+      @target_override_vars = {}
+      @target_inherit_append = {}
+      @target_pattern_vars = {}
+      @target_pattern_override_vars = {}
+      @target_pattern_inherit_append = {}
+      @target_pattern_order = []
+      @exports = {}
       @cond_stack = []
       seed_env
     end
 
     def evaluate
-      current_rule = nil
+      current_rules = []
       @lines.each do |line|
         s = line.stripped
         next if s.nil? || s.empty?
@@ -52,12 +66,14 @@ module RMake
         end
 
         if line.recipe
-          if current_rule
+          if current_rules && !current_rules.empty?
             recipe = Util.strip_leading_ws(line.raw)
-            current_rule.recipe << recipe
+            current_rules.each { |rule| rule.recipe << recipe }
           end
           next
         end
+
+        current_rules = []
 
         # Variable assignment (+ export / override)
         force_override = false
@@ -72,10 +88,13 @@ module RMake
         end
         if (assign = parse_assignment(s))
           name, op, value = assign
+          name = expand(name.to_s).to_s.strip
+          raise make_error(line, "*** empty variable name.  Stop.") if name.empty?
           assign_var(name, op, value, force_override)
+          mark_export(name) if export_only
           next
         elsif export_only
-          # "export VAR" without assignment: ignore for now.
+          Util.split_ws(expand(s)).each { |name| mark_export(name) unless name.nil? || name.empty? }
           next
         end
 
@@ -101,6 +120,10 @@ module RMake
           @suffixes = list
           next
         end
+        if s.start_with?(".SECONDEXPANSION:")
+          @second_expansion = true
+          next
+        end
         if s.start_with?(".DELETE_ON_ERROR:")
           @delete_on_error = true
           next
@@ -114,40 +137,70 @@ module RMake
         # Rules
         if (rule = parse_rule(s))
           targets_str, sep, prereq_part_raw = rule
+          static_target_pattern = nil
+          if sep == ":"
+            idx2, len2 = find_top_level_colon(prereq_part_raw.to_s)
+            if idx2
+              candidate = expand(prereq_part_raw[0...idx2].to_s).to_s.strip
+              if candidate.index("%")
+                static_target_pattern = candidate
+                prereq_part_raw = prereq_part_raw[(idx2 + len2)..-1].to_s
+              end
+            end
+          end
           inline = nil
           if (sc = find_top_level_char(prereq_part_raw.to_s, ";"))
             inline = prereq_part_raw[(sc + 1)..-1].to_s
             prereq_part_raw = prereq_part_raw[0...sc].to_s
           end
-          assign = parse_assignment(prereq_part_raw.to_s.strip)
+          assign = parse_target_assignment(prereq_part_raw.to_s.strip)
           if assign && (inline.nil? || inline.strip.empty?)
+            aname, aop, aval, aforce = assign
+            aname = expand(aname.to_s).to_s.strip
+            raise make_error(line, "*** empty variable name.  Stop.") if aname.empty?
             targets = Util.split_ws(expand(targets_str)).reject(&:empty?)
             targets = targets.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }
-            targets.each { |t| assign_target_var(t, assign[0], assign[1], assign[2]) }
+            targets.each { |t| assign_target_var(t, aname, aop, aval, aforce) }
             next
           end
           targets = Util.split_ws(expand(targets_str)).reject(&:empty?)
           targets = targets.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }
           prereq_part = expand(prereq_part_raw)
           normal, order_only = prereq_part.split("|", 2).map { |x| x ? x.strip : "" }
-          prereqs = Util.filter_prereq_words(Util.split_ws(normal.to_s).reject(&:empty?)).map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
-          order_only = Util.filter_prereq_words(Util.split_ws(order_only.to_s).reject(&:empty?)).map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
-          current_rule = Rule.new(targets, prereqs, order_only, [], sep == "::")
-
-          # Suffix rules like .c.o:
-          if targets.length == 1 && targets[0].start_with?(".") && !targets[0].include?("/") && targets[0].count(".") == 2 && prereq_part_raw.to_s.strip.empty?
-            src, dst = targets[0].split(".", 3)[1..2].map { |suf| ".#{suf}" }
-            if @suffixes.empty? || @suffixes.include?(src) || @suffixes.include?(dst)
-              @suffix_rules << [src, dst, prereqs, current_rule.recipe]
-            else
-              @rules << current_rule
+          prereq_words = Util.filter_prereq_words(Util.split_ws(normal.to_s).reject(&:empty?))
+          order_words = Util.filter_prereq_words(Util.split_ws(order_only.to_s).reject(&:empty?))
+          if static_target_pattern && !static_target_pattern.empty?
+            current_rules = []
+            targets.each do |t|
+              stem = static_pattern_stem(t, static_target_pattern)
+              next if stem.nil?
+              prereqs = prereq_words.map { |w| static_replace_percent(w, stem) }.map { |x| Util.normalize_path(Util.normalize_brace_path(x)) }.reject(&:empty?)
+              ord = order_words.map { |w| static_replace_percent(w, stem) }.map { |x| Util.normalize_path(Util.normalize_brace_path(x)) }.reject(&:empty?)
+              rule_obj = Rule.new([t], prereqs, ord, [], sep == "::")
+              @rules << rule_obj
+              current_rules << rule_obj
             end
           else
-            @rules << current_rule
+            prereqs = prereq_words.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
+            order_only = order_words.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
+            rule_obj = Rule.new(targets, prereqs, order_only, [], sep == "::")
+            current_rules = [rule_obj]
+
+            # Suffix rules like .c.o:
+            if targets.length == 1 && targets[0].start_with?(".") && !targets[0].include?("/") && targets[0].count(".") == 2 && prereq_part_raw.to_s.strip.empty?
+              src, dst = targets[0].split(".", 3)[1..2].map { |suf| ".#{suf}" }
+              if @suffixes.empty? || @suffixes.include?(src) || @suffixes.include?(dst)
+                @suffix_rules << [src, dst, prereqs, rule_obj.recipe]
+              else
+                @rules << rule_obj
+              end
+            else
+              @rules << rule_obj
+            end
           end
           if inline && !inline.strip.empty?
             recipe = Util.strip_leading_ws(inline)
-            current_rule.recipe << recipe
+            current_rules.each { |rule_obj| rule_obj.recipe << recipe }
           end
           next
         end
@@ -159,6 +212,14 @@ module RMake
       end
 
       self
+    end
+
+    def second_expansion?
+      @second_expansion
+    end
+
+    def set_env_override(flag)
+      @env_override = !!flag
     end
 
     def delete_on_error?
@@ -186,8 +247,32 @@ module RMake
     end
 
     def set_override(name, value)
+      set_override_with_op(name, "=", value)
+    end
+
+    def set_override_with_op(name, op, value)
       @overrides[name] = true
-      @vars[name] = Var.recursive(value)
+      case op
+      when ":=", "::="
+        @vars[name] = Var.simple(expand(value.to_s))
+      when ":::="
+        @vars[name] = Var.recursive(recursive_immediate(value.to_s))
+      when "+="
+        prev = @vars[name]
+        if prev
+          if prev.simple
+            @vars[name] = Var.simple(append_with_space(prev.value, expand(value.to_s)))
+          else
+            @vars[name] = Var.recursive(append_with_space(prev.value, value.to_s))
+          end
+        else
+          @vars[name] = Var.recursive(value.to_s)
+        end
+      when "?="
+        @vars[name] ||= Var.recursive(value.to_s)
+      else
+        @vars[name] = Var.recursive(value.to_s)
+      end
     end
 
     def merge!(ev)
@@ -207,6 +292,26 @@ module RMake
           (@target_vars[t] ||= {}).merge!(vars)
         end
       end
+      if ev.instance_variable_defined?(:@target_inherit_append)
+        ev.instance_variable_get(:@target_inherit_append).each do |t, vars|
+          (@target_inherit_append[t] ||= {}).merge!(vars)
+        end
+      end
+      if ev.respond_to?(:target_pattern_vars)
+        ev.target_pattern_vars.each do |pat, vars|
+          (@target_pattern_vars[pat] ||= {}).merge!(vars)
+          @target_pattern_order << pat unless @target_pattern_order.include?(pat)
+        end
+      end
+      if ev.instance_variable_defined?(:@target_pattern_inherit_append)
+        ev.instance_variable_get(:@target_pattern_inherit_append).each do |pat, vars|
+          (@target_pattern_inherit_append[pat] ||= {}).merge!(vars)
+          @target_pattern_order << pat unless @target_pattern_order.include?(pat)
+        end
+      end
+      if ev.instance_variable_defined?(:@exports)
+        ev.instance_variable_get(:@exports).each_key { |name| mark_export(name) }
+      end
     end
 
     private
@@ -218,58 +323,261 @@ module RMake
         @vars["MFLAGS"] = Var.simple(ENV["MFLAGS"] || "")
         @vars["mflags"] = Var.simple(@vars["MFLAGS"].value)
         @vars["MAKECMDGOALS"] = Var.simple(ENV["MAKECMDGOALS"] || "")
+        @vars["SHELL"] = Var.simple(ENV["SHELL"] || "/bin/sh")
       else
         @vars["MAKE"] = Var.simple("make")
         @vars["MFLAGS"] = Var.simple("")
         @vars["mflags"] = Var.simple("")
         @vars["MAKECMDGOALS"] = Var.simple("")
+        @vars["SHELL"] = Var.simple("/bin/sh")
       end
     end
 
     def assign_var(name, op, value, force_override = false)
+      if @env_override && !force_override && !@overrides[name] && @vars[name].nil? && !@make_overrides[name]
+        envv = env_var(name)
+        if envv && !envv.empty?
+          @overrides[name] = true
+          @vars[name] = Var.simple(envv)
+        end
+      end
       return if @overrides[name] && !force_override
+      return if @make_overrides[name] && !force_override
       case op
       when "="
         @vars[name] = Var.recursive(value)
-      when ":="
+      when ":=", "::="
         @vars[name] = Var.simple(expand(value))
+      when ":::="
+        @vars[name] = Var.recursive(recursive_immediate(value))
       when "+="
         prev = @vars[name]
+        if prev.nil?
+          envv = env_var(name)
+          if envv && !envv.empty?
+            prev = Var.simple(envv)
+            @vars[name] = prev
+          end
+        end
         if prev
           if prev.simple
-            @vars[name] = Var.simple(prev.value + " " + expand(value))
+            @vars[name] = Var.simple(append_with_space(prev.value, expand(value)))
           else
-            @vars[name] = Var.recursive(prev.value + " " + value)
+            @vars[name] = Var.recursive(append_with_space(prev.value, value))
           end
         else
           @vars[name] = Var.recursive(value)
         end
+      when "?="
+        @vars[name] ||= Var.recursive(value)
       else
         @vars[name] = Var.recursive(value)
       end
+      @make_overrides[name] = true if force_override
     end
 
-    def assign_target_var(target, name, op, value)
+    def assign_target_var(target, name, op, value, force_override = false)
+      if target && target.index("%")
+        return assign_target_pattern_var(target, name, op, value, force_override)
+      end
       tvars = (@target_vars[target] ||= {})
+      tovr = (@target_override_vars[target] ||= {})
+      if @env_override && !force_override && !@overrides[name] && !@make_overrides[name] &&
+         tvars[name].nil? && !tovr[name] && !pattern_override_for?(target, name)
+        envv = env_var(name)
+        if envv && !envv.empty?
+          @overrides[name] = true
+          tvars[name] = Var.simple(envv)
+        end
+      end
+      return if @overrides[name] && !force_override
+      return if @make_overrides[name] && !force_override
+      return if pattern_override_for?(target, name) && !force_override
+      return if tovr[name] && !force_override
       case op
       when "="
         tvars[name] = Var.recursive(value)
-      when ":="
+        (@target_inherit_append[target] ||= {})[name] = false
+      when ":=", "::="
         tvars[name] = Var.simple(expand(value))
+        (@target_inherit_append[target] ||= {})[name] = false
+      when ":::="
+        tvars[name] = Var.recursive(recursive_immediate(value))
+        (@target_inherit_append[target] ||= {})[name] = false
       when "+="
-        prev = tvars[name] || @vars[name]
+        inherit = false
+        from_local = false
+        from_pattern = false
+        from_global = false
+        prev = tvars[name]
+        if prev
+          from_local = true
+          inherit = (@target_inherit_append[target] || {})[name] ? true : false
+        end
+        if prev.nil?
+          pvars = pattern_target_vars_for(target)
+          if pvars && pvars[name]
+            prev = pvars[name]
+            tvars[name] = prev
+            from_pattern = true
+            inherit = pattern_target_inherit_for(target)[name] ? true : false
+          end
+        end
+        if prev.nil?
+          prev = @vars[name]
+          from_global = !prev.nil?
+        end
+        if prev.nil?
+          envv = env_var(name)
+          if envv && !envv.empty?
+            prev = Var.simple(envv)
+            tvars[name] = prev
+            from_global = true
+          end
+        end
         if prev
           if prev.simple
-            tvars[name] = Var.simple(prev.value + " " + expand(value))
+            tvars[name] = Var.simple(append_with_space(prev.value, expand(value)))
           else
-            tvars[name] = Var.recursive(prev.value + " " + value)
+            tvars[name] = Var.recursive(append_with_space(prev.value, value))
           end
         else
           tvars[name] = Var.recursive(value)
         end
+        if from_global
+          (@target_inherit_append[target] ||= {})[name] = false
+        elsif from_local || from_pattern
+          (@target_inherit_append[target] ||= {})[name] = inherit
+        else
+          (@target_inherit_append[target] ||= {})[name] = true
+        end
+      when "?="
+        tvars[name] ||= Var.recursive(value)
+        (@target_inherit_append[target] ||= {})[name] = false
       else
         tvars[name] = Var.recursive(value)
+        (@target_inherit_append[target] ||= {})[name] = false
       end
+      tovr[name] = true if force_override
+    end
+
+    def assign_target_pattern_var(pattern, name, op, value, force_override = false)
+      pvars = (@target_pattern_vars[pattern] ||= {})
+      povr = (@target_pattern_override_vars[pattern] ||= {})
+      @target_pattern_order << pattern unless @target_pattern_order.include?(pattern)
+      if @env_override && !force_override && !@overrides[name] && !@make_overrides[name] &&
+         pvars[name].nil? && !povr[name]
+        envv = env_var(name)
+        if envv && !envv.empty?
+          @overrides[name] = true
+          pvars[name] = Var.simple(envv)
+        end
+      end
+      return if @overrides[name] && !force_override
+      return if @make_overrides[name] && !force_override
+      return if povr[name] && !force_override
+      case op
+      when "="
+        pvars[name] = Var.recursive(value)
+        (@target_pattern_inherit_append[pattern] ||= {})[name] = false
+      when ":=", "::="
+        pvars[name] = Var.simple(expand(value))
+        (@target_pattern_inherit_append[pattern] ||= {})[name] = false
+      when ":::="
+        pvars[name] = Var.recursive(recursive_immediate(value))
+        (@target_pattern_inherit_append[pattern] ||= {})[name] = false
+      when "+="
+        inherit = false
+        from_local = false
+        from_global = false
+        prev = pvars[name] || @vars[name]
+        if pvars[name]
+          from_local = true
+          inherit = (@target_pattern_inherit_append[pattern] || {})[name] ? true : false
+        elsif @vars[name]
+          from_global = true
+        end
+        if prev.nil?
+          envv = env_var(name)
+          if envv && !envv.empty?
+            prev = Var.simple(envv)
+            pvars[name] = prev
+            from_global = true
+          end
+        end
+        if prev
+          if prev.simple
+            pvars[name] = Var.simple(append_with_space(prev.value, expand(value)))
+          else
+            pvars[name] = Var.recursive(append_with_space(prev.value, value))
+          end
+        else
+          pvars[name] = Var.recursive(value)
+        end
+        if from_global
+          (@target_pattern_inherit_append[pattern] ||= {})[name] = false
+        elsif from_local
+          (@target_pattern_inherit_append[pattern] ||= {})[name] = inherit
+        else
+          (@target_pattern_inherit_append[pattern] ||= {})[name] = true
+        end
+      when "?="
+        pvars[name] ||= Var.recursive(value)
+        (@target_pattern_inherit_append[pattern] ||= {})[name] = false
+      else
+        pvars[name] = Var.recursive(value)
+        (@target_pattern_inherit_append[pattern] ||= {})[name] = false
+      end
+      povr[name] = true if force_override
+    end
+
+    def pattern_target_vars_for(target)
+      out = {}
+      @target_pattern_order.each do |pat|
+        next unless Util.match_pattern(target.to_s, pat.to_s)
+        vars = @target_pattern_vars[pat]
+        next if vars.nil?
+        out.merge!(vars)
+      end
+      out
+    end
+    public :pattern_target_vars_for
+
+    def pattern_override_for?(target, name)
+      @target_pattern_order.each do |pat|
+        next unless Util.match_pattern(target.to_s, pat.to_s)
+        ov = @target_pattern_override_vars[pat]
+        return true if ov && ov[name]
+      end
+      false
+    end
+
+    def pattern_target_inherit_for(target)
+      out = {}
+      @target_pattern_order.each do |pat|
+        next unless Util.match_pattern(target.to_s, pat.to_s)
+        vars = @target_pattern_inherit_append[pat]
+        next if vars.nil?
+        out.merge!(vars)
+      end
+      out
+    end
+    public :pattern_target_inherit_for
+
+    def env_var(name)
+      return nil if name.nil? || name.empty?
+      if Object.const_defined?(:ENV)
+        return ENV[name]
+      end
+      return nil unless Util.respond_to?(:shell_capture)
+      out = Util.shell_capture("printenv #{Util.shell_escape(name)}")
+      out && out.empty? ? nil : out
+    end
+
+    def mark_export(name)
+      return if name.nil? || name.empty?
+      @exports[name] = true
+      @vars["__RMAKE_EXPORTS__"] = Var.simple(@exports.keys.join(" "))
     end
 
     def include_file(path, optional = false)
@@ -313,6 +621,19 @@ module RMake
     end
 
     def handle_condition(s)
+      if s.start_with?("ifdef ") || s.start_with?("ifndef ")
+        op, expr = s.split(" ", 2)
+        cond = eval_defined_condition(op, expr.to_s)
+        parent_active = cond_active?
+        @cond_stack << {
+          parent_active: parent_active,
+          active: parent_active && cond,
+          seen_true: cond,
+          else_seen: false,
+        }
+        return true
+      end
+
       if s.start_with?("ifeq ") || s.start_with?("ifneq ")
         op, expr = s.split(" ", 2)
         cond = eval_condition(op, expr.to_s)
@@ -331,6 +652,14 @@ module RMake
         rest = Util.strip_leading_ws(rest)
         op, expr = rest.split(" ", 2)
         handle_else_if(op, expr.to_s)
+        return true
+      end
+
+      if s.start_with?("else ifdef ") || s.start_with?("else ifndef ")
+        rest = s[5..-1].to_s
+        rest = Util.strip_leading_ws(rest)
+        op, expr = rest.split(" ", 2)
+        handle_else_if_defined(op, expr.to_s)
         return true
       end
 
@@ -361,6 +690,20 @@ module RMake
       top[:else_seen] = true
     end
 
+    def handle_else_if_defined(op, expr)
+      top = @cond_stack.last
+      return unless top
+      parent_active = top[:parent_active]
+      if top[:seen_true]
+        top[:active] = false
+      else
+        cond = eval_defined_condition(op, expr)
+        top[:active] = parent_active && cond
+        top[:seen_true] = cond
+      end
+      top[:else_seen] = true
+    end
+
     def handle_else
       top = @cond_stack.last
       return unless top
@@ -384,6 +727,17 @@ module RMake
       end
     end
 
+    def eval_defined_condition(op, expr)
+      name = expand(expr.to_s).to_s.strip
+      val = ""
+      if !name.empty? && @vars[name]
+        v = @vars[name]
+        val = v.simple ? v.value.to_s : expand(v.value.to_s)
+      end
+      cond = !val.empty?
+      op == "ifdef" ? cond : !cond
+    end
+
     def parse_condition_args(expr)
       expr = expr.to_s.strip
       if expr.start_with?("(") && expr.end_with?(")")
@@ -402,17 +756,48 @@ module RMake
       i -= 1 while i >= 0 && (s[i] == " " || s[i] == "\t")
       op = "="
       name_end = i + 1
-      if i >= 0 && s[i] == ":"
+      if i >= 2 && s[(i - 2)..i] == ":::"
+        op = ":::="
+        name_end = i - 2
+      elsif i >= 1 && s[(i - 1)..i] == "::"
+        op = "::="
+        name_end = i - 1
+      elsif i >= 0 && s[i] == ":"
         op = ":="
         name_end = i
       elsif i >= 0 && s[i] == "+"
         op = "+="
         name_end = i
+      elsif i >= 0 && s[i] == "?"
+        op = "?="
+        name_end = i
       end
       name = s[0...name_end].strip
-      return nil if name.empty? || name.index(" ")
-      value = (s[(eq + 1)..-1] || "").lstrip
-      [name, op, value]
+      return nil if name.empty?
+      return nil unless find_top_level_char(name, ":").nil?
+      value = strip_hws((s[(eq + 1)..-1] || ""))
+      [name, op.strip, value]
+    end
+
+    def parse_target_assignment(s)
+      t = s.to_s.strip
+      force_override = false
+      loop do
+        changed = false
+        if t.start_with?("override ")
+          t = t[9..-1].to_s.lstrip
+          force_override = true
+          changed = true
+        end
+        if t.start_with?("export ")
+          t = t[7..-1].to_s.lstrip
+          changed = true
+        end
+        break unless changed
+      end
+      assign = parse_assignment(t)
+      return nil unless assign
+      [assign[0], assign[1], assign[2], force_override]
     end
 
     def parse_include(s)
@@ -460,6 +845,32 @@ module RMake
       nil
     end
 
+    def recursive_immediate(value)
+      expand(value.to_s).to_s.gsub("$", "$$")
+    end
+
+    def strip_hws(str)
+      i = 0
+      while i < str.length && (str[i] == " " || str[i] == "\t")
+        i += 1
+      end
+      str[i..-1].to_s
+    end
+
+    def append_with_space(left, right)
+      l = left.to_s
+      r = right.to_s
+      return r if l.empty?
+      return l if r.empty?
+      "#{l} #{r}"
+    end
+
+    def make_error(line, msg)
+      file = line && line.respond_to?(:filename) && line.filename ? line.filename : "<makefile>"
+      ln = line && line.respond_to?(:lineno) && line.lineno ? line.lineno : 1
+      MakeError.new("#{file}:#{ln}: #{msg}")
+    end
+
     def find_top_level_colon(s)
       i = 0
       depth = 0
@@ -486,6 +897,23 @@ module RMake
         i += 1
       end
       [nil, 0]
+    end
+
+    def static_pattern_stem(target, pattern)
+      idx = pattern.index("%")
+      if idx.nil?
+        return "" if target == pattern
+        return nil
+      end
+      pre = pattern[0...idx]
+      post = pattern[(idx + 1)..-1].to_s
+      return nil unless target.start_with?(pre) && target.end_with?(post)
+      target[pre.length...(target.length - post.length)]
+    end
+
+    def static_replace_percent(word, stem)
+      return word unless word.index("%")
+      word.gsub("%", stem.to_s)
     end
 
     class Var

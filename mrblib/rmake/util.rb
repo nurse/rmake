@@ -89,6 +89,10 @@ module RMake
       if value.nil?
         var = vars[name]
         value = var ? (var.simple ? var.value : expand(var.value, vars, ctx)) : ""
+        if var.nil?
+          envv = env_value(name)
+          value = envv unless envv.nil?
+        end
       end
 
 
@@ -100,6 +104,17 @@ module RMake
       end
 
       value
+    end
+
+    def self.env_value(name)
+      return nil if name.nil? || name.empty?
+      if Object.const_defined?(:ENV)
+        return ENV[name]
+      end
+      return nil unless respond_to?(:shell_capture)
+      out = shell_capture("printenv #{shell_escape(name)}")
+      return nil if out.nil? || out.empty?
+      out
     end
 
     def self.split_ws(str)
@@ -202,6 +217,10 @@ module RMake
 
     def self.eval_func(func, args, vars, ctx)
       case func
+      when "info"
+        msg = expand(args.to_s, vars, ctx)
+        puts msg
+        return ""
       when "strip"
         arg = expand(args.to_s, vars, ctx)
         return strip_ws(arg)
@@ -212,6 +231,7 @@ module RMake
         return b.include?(a) ? a : ""
       when "shell"
         cmd = expand(args.to_s, vars, ctx)
+        cmd = with_exported_env(cmd, vars, ctx)
         return shell_capture(cmd)
       when "if"
         a, b, c = split_func_args_all(args)
@@ -358,17 +378,21 @@ module RMake
         out = ""
         t = Time.now
         usec = t.respond_to?(:usec) ? t.usec : 0
-        tmp = "/tmp/rmake.shell.#{t.to_i}.#{usec}"
+        @shell_capture_seq ||= 0
+        @shell_capture_seq += 1
+        pid_part = (Process.respond_to?(:pid) ? Process.pid : 0)
+        tmp = "/tmp/rmake.shell.#{pid_part}.#{t.to_i}.#{usec}.#{@shell_capture_seq}"
         begin
           sh_cmd = "#{cmd} > #{shell_escape(tmp)}"
           pid = Process.spawn("/bin/sh", "-c", sh_cmd)
           Process.waitpid2(pid)
           if File.exist?(tmp)
             out = File.read(tmp).to_s
-            File.delete(tmp) rescue nil
           end
         rescue
           return ""
+        ensure
+          File.delete(tmp) rescue nil
         end
         out = out.to_s
         return normalize_shell_output(out)
@@ -384,6 +408,34 @@ module RMake
         end
       end
       ""
+    end
+
+    def self.with_exported_env(cmd, vars, ctx = {})
+      return cmd if cmd.nil? || cmd.empty?
+      return cmd if vars.nil?
+      exports_var = vars["__RMAKE_EXPORTS__"]
+      return cmd unless exports_var
+      exports = if exports_var.simple
+        exports_var.value.to_s
+      else
+        expand(exports_var.value.to_s, vars, ctx || {})
+      end
+      names = split_ws(exports)
+      return cmd if names.empty?
+      assigns = []
+      names.each do |name|
+        next if name.nil? || name.empty?
+        val = nil
+        if (var = vars[name])
+          val = var.simple ? var.value.to_s : expand(var.value.to_s, vars, ctx || {})
+        else
+          val = env_value(name)
+        end
+        next if val.nil?
+        assigns << "#{name}=#{shell_escape(val.to_s)}"
+      end
+      return cmd if assigns.empty?
+      "env #{assigns.join(' ')} /bin/sh -c #{shell_escape(cmd)}"
     end
 
     def self.normalize_shell_output(out)

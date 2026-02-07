@@ -25,4 +25,6 @@ end
 status = RMake::CLI.run(ARGV)
 if Kernel.respond_to?(:exit)
   exit status
+elsif status != 0
+  raise "rmake failed with status #{status}"
 end

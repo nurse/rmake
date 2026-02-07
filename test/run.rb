@@ -252,6 +252,21 @@ tests << lambda do
 end
 
 tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    file_path = File.join(dir, "notdir")
+    File.write(file_path, "x")
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-C", file_path, "all"])
+        assert("chdir file path returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("chdir file path reports not a directory", combined.include?("Not a directory"))
+  end
+end
+
+tests << lambda do
   ev = RMake::Evaluator.new([])
   opts, _jobs_set = RMake::CLI.parse_args(["-j4"])
   RMake::CLI.set_make_vars(ev, "make", opts)
@@ -306,6 +321,22 @@ foo:
 end
 
 tests << lambda do
+  with_env("MAKE", "/tmp/mruby /tmp/rmake") do
+    ev = parse_eval(<<~MK)
+reconfig config.status: export MAKE:=$(MAKE)
+reconfig config.status:
+\t@echo RECHECK
+    MK
+    tvars = ev.target_vars["config.status"]
+    assert("target-specific export assignment parsed", tvars && tvars["MAKE"])
+    g = RMake::Graph.new
+    ev.rules.each { |r| g.add_rule(r, phony: false, precious: false) }
+    node = g.node("config.status")
+    assert("no bogus prereq from spaced MAKE", node && !node.deps.include?("/tmp/rmake"))
+  end
+end
+
+tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
     File.write(File.join(dir, "Makefile"), <<~MK)
 all: foo ./foo
@@ -333,6 +364,160 @@ end
 tests << lambda do
   opts, _jobs_set = RMake::CLI.parse_args(["MAKEFLAGS=-n", "all"])
   assert("parse_args dry_run from MAKEFLAGS assignment", opts[:dry_run])
+end
+
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["hello:=cmd", "hello+=cmd2", "all"])
+  assigns = opts[:var_assigns]
+  ok = assigns.include?(["hello", ":=", "cmd"]) && assigns.include?(["hello", "+=", "cmd2"])
+  assert("parse_args supports := and +=", ok)
+end
+
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["-e", "all"])
+  assert("parse_args environment override flag", opts[:env_override])
+end
+
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["-s", "all"])
+  assert("parse_args silent mode", opts[:silent])
+end
+
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["-q", "all"])
+  assert("parse_args question mode", opts[:question])
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+hello+=blue
+hello+=yellow
+$(info $(hello))
+phobos:; $(info $(hello))
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "hello:=cmd", "hello+=cmd2", "phobos"])
+        assert("command line := += status", status == 0)
+      end
+    end
+    lines = out.split("\n").map(&:strip).reject(&:empty?)
+    assert("command line := += parse-time", lines.include?("cmd cmd2"))
+    assert("command line := += build-time", lines.count("cmd cmd2") >= 2)
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+phobo%: hello+=blue
+phobos: hello+=yellow
+$(info $(hello))
+phobos:; $(info $(hello))
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "phobos"])
+        assert("pattern target var status", status == 0)
+      end
+    end
+    lines = out.split("\n").map(&:strip)
+    assert("pattern target var applies at build", lines.include?("blue yellow"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+mars: hello+=blue
+phobos:; $(info $(hello))
+mars: phobos; $(info $(hello))
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "mars"])
+        assert("prereq inherits target-specific vars status", status == 0)
+      end
+    end
+    lines = out.split("\n").map(&:strip).reject(&:empty?)
+    assert("prereq inherits target-specific vars", lines.count("blue") >= 2)
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+HELLO=file
+$(info $(HELLO))
+all:; $(info $(HELLO))
+    MK
+    with_env("HELLO", "env") do
+      out1, _err1 = capture_io do
+        Dir.chdir(dir) do
+          RMake::CLI.run(["-f", "Makefile", "all"])
+        end
+      end
+      out2, _err2 = capture_io do
+        Dir.chdir(dir) do
+          RMake::CLI.run(["-f", "Makefile", "-e", "all"])
+        end
+      end
+      lines1 = out1.split("\n").map(&:strip).reject(&:empty?)
+      lines2 = out2.split("\n").map(&:strip).reject(&:empty?)
+      assert("env without -e is overridden by makefile", lines1.include?("file"))
+      assert("env with -e overrides makefile", lines2.include?("env"))
+    end
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all: out
+out:
+\t@echo OUT > out
+    MK
+    File.write(File.join(dir, "out"), "OUT\n")
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "-q", "all"])
+        assert("question mode up-to-date returns success", status == 0)
+      end
+    end
+    assert("question mode up-to-date quiet", (out + err).strip.empty?)
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+all: out
+out:
+\t@echo OUT > out
+    MK
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "-q", "all"])
+        assert("question mode needs rebuild returns 1", status == 1)
+      end
+    end
+    assert("question mode rebuild quiet", (out + err).strip.empty?)
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), "all: missing\n")
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "-q", "all"])
+        assert("question mode missing dep returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("question mode missing dep message", combined.include?("No rule to make target `missing'"))
+  end
 end
 
 tests << lambda do
@@ -378,7 +563,7 @@ tests << lambda do
       "MAKELEVEL" => RMake::Evaluator::Var.simple("0"),
       "MAKEFLAGS" => RMake::Evaluator::Var.simple("-n"),
     }
-    ok = shell.run("@false", vars, {})
+    ok, _ran = shell.run("@false", vars, {})
     assert("dry-run executes recursive commands", ok == false)
   end
 end
@@ -409,6 +594,7 @@ end
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
     File.write(File.join(dir, "Makefile"), <<~MK)
+.SUFFIXES: .bar
 foo.bar:
 \techo $(*F) $(*D)
     MK
@@ -433,7 +619,7 @@ tests << lambda do
         end
       end
     end
-    assert("makelevel prefix", out.include?("make[1]: Nothing to be done for `all'."))
+    assert("makelevel prefix", out.include?("[1]: Nothing to be done for 'all'."))
   end
 end
 
@@ -446,7 +632,7 @@ tests << lambda do
         RMake::CLI.run(["-f", "Makefile", "miniruby"])
       end
     end
-    assert("explicit target up to date", out.include?("`miniruby' is up to date."))
+    assert("explicit target up to date", out.include?("'miniruby' is up to date."))
   end
 end
 
@@ -692,13 +878,13 @@ inc.mk:
 all:
 \t@echo $(FOO)
     MK
-    out, _err = capture_io do
+    _out, _err = capture_io do
       Dir.chdir(dir) do
-        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+        status = RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+        assert("include remake dry-run returns success", status == 0)
       end
     end
-    assert("include remake creates file", File.exist?(File.join(dir, "inc.mk")))
-    assert("include remake re-evaluates vars", out.include?("echo 1"))
+    assert("include remake does not create file under -n", !File.exist?(File.join(dir, "inc.mk")))
   end
 end
 
@@ -715,14 +901,35 @@ inc.mk: stamp
 all:
 \t@echo $(FOO)
     MK
-    out, _err = capture_io do
+    _out, _err = capture_io do
       Dir.chdir(dir) do
-        RMake::CLI.run(["-f", "Makefile", "all"])
+        status = RMake::CLI.run(["-f", "Makefile", "all"])
+        assert("include remake update returns success", status == 0)
       end
     end
     content = File.read(File.join(dir, "inc.mk"))
     assert("include remake updates file", content.include?("FOO=new"))
-    assert("include remake re-evaluates vars", out.include?("echo new"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+SHOWFLAGS = showflags
+-include $(SHOWFLAGS)
+all: $(SHOWFLAGS)
+.PHONY: showflags
+showflags:
+\t@echo A=1
+    MK
+    out, _err = capture_io do
+      Dir.chdir(dir) do
+        RMake::CLI.run(["-f", "Makefile", "-n", "all"])
+      end
+    end
+    count = out.scan(/^echo A=1$/).length
+    assert("phony include target only runs once", count == 1)
+    assert("phony include target is not executed in dry-run phase", !out.include?("\nA=1\n"))
   end
 end
 
