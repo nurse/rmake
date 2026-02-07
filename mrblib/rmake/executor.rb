@@ -1,6 +1,6 @@
 module RMake
   class Executor
-    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil, touch = false, what_if = nil, always_make = false)
+    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil, touch = false, what_if = nil, always_make = false, keep_going = false)
       @graph = graph
       @shell = shell
       @vars = vars
@@ -9,6 +9,7 @@ module RMake
       @trace = trace
       @touch = !!touch
       @always_make = !!always_make
+      @keep_going = !!keep_going
       @what_if = {}
       (what_if || []).each do |w|
         next if w.nil? || w.empty?
@@ -22,6 +23,7 @@ module RMake
       @suffixes = suffixes || []
       @second_expansion = !!second_expansion
       @building = {}
+      @failed = {}
       @mtime_cache = {}
       @resolve_cache = {}
       @node_cache = {}
@@ -46,7 +48,9 @@ module RMake
       end
       key = node.name
       return true if @built_phony[key]
+      return false if @failed[key]
       return true if @building[key] == :done
+      return false if @building[key] == :failed
       if @building[key] == :building
         return true
       end
@@ -55,13 +59,32 @@ module RMake
 
       node_vars = vars_for(node, inherited)
       deps, order_only = expanded_prereqs(node)
-      deps.each { |dep| return false unless build(dep, node.name, node_vars) }
-      order_only.each { |dep| return false unless build(dep, node.name, node_vars) }
+      dep_failed = false
+      deps.each do |dep|
+        ok = build(dep, node.name, node_vars)
+        unless ok
+          dep_failed = true
+          return false unless @keep_going
+        end
+      end
+      order_only.each do |dep|
+        ok = build(dep, node.name, node_vars)
+        unless ok
+          dep_failed = true
+          return false unless @keep_going
+        end
+      end
 
       if node.phony && (node.recipe.nil? || node.recipe.empty?)
         @built_phony[key] = true
         @building[key] = :done
         return true
+      end
+
+      if dep_failed
+        @failed[key] = true
+        @building[key] = :failed
+        return false
       end
 
       if need_build?(node, deps, node_vars)
@@ -77,6 +100,9 @@ module RMake
         end
         unless ok
           cleanup_target(node)
+          emit_recipe_error(node)
+          @failed[key] = true
+          @building[key] = :failed
           return false
         end
         restat_update(node.name, old_mtime)
@@ -91,6 +117,7 @@ module RMake
     end
 
     def build_parallel(target, jobs = 1)
+      return build(target) if @keep_going
       return build(target) if jobs <= 1
       return build(target) unless Shell.supports_spawn?
       return false unless validate_deps(target, nil, {})
@@ -563,16 +590,52 @@ module RMake
     def missing_dep_error(target, parent)
       prefix = make_prefix
       msg = if parent && !parent.empty?
-        "#{prefix}: *** No rule to make target '#{target}', needed by '#{parent}'.  Stop."
+        if @keep_going
+          "#{prefix}: *** No rule to make target '#{target}', needed by '#{parent}'."
+        else
+          "#{prefix}: *** No rule to make target '#{target}', needed by '#{parent}'.  Stop."
+        end
       else
-        "#{prefix}: *** No rule to make target '#{target}'.  Stop."
+        if @keep_going
+          "#{prefix}: *** No rule to make target '#{target}'."
+        else
+          "#{prefix}: *** No rule to make target '#{target}'.  Stop."
+        end
       end
-      if Kernel.respond_to?(:warn)
+      emit_error_message(msg)
+      false
+    end
+
+    def emit_recipe_error(node)
+      info = @shell.respond_to?(:last_error) ? @shell.last_error : nil
+      status = info && info[:status] ? info[:status].to_i : 1
+      file = info ? info[:file].to_s : ""
+      line = info ? info[:line].to_s : ""
+      prefix = make_prefix
+      if !file.empty? && !line.empty?
+        msg = "#{prefix}: *** [#{file}:#{line}: #{node.name}] Error #{status}"
+      else
+        msg = "#{prefix}: *** [#{node.name}] Error #{status}"
+      end
+      emit_error_message(msg)
+    end
+
+    def emit_error_message(msg)
+      io = nil
+      begin
+        io = $stderr
+      rescue StandardError
+        io = nil
+      end
+      if io && io.respond_to?(:puts)
+        io.puts(msg)
+      elsif Kernel.respond_to?(:warn)
         warn msg
+      elsif Object.const_defined?(:STDERR) && STDERR.respond_to?(:puts)
+        STDERR.puts(msg)
       else
         puts msg
       end
-      false
     end
 
     def make_prefix

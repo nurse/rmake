@@ -3,6 +3,14 @@ module RMake
     class ArgError < StandardError; end
 
     def self.run(argv)
+      begin
+        STDOUT.sync = true if Object.const_defined?(:STDOUT) && STDOUT.respond_to?(:sync=)
+      rescue StandardError
+      end
+      begin
+        STDERR.sync = true if Object.const_defined?(:STDERR) && STDERR.respond_to?(:sync=)
+      rescue StandardError
+      end
       opts, jobs_set = parse_args(argv)
 
       if opts[:arg_error]
@@ -67,7 +75,8 @@ module RMake
           end
           remade_makefiles, makefile_error = remake_makefiles(evalr, graph, opts, remade, precompleted, reported_missing_makefiles)
           return 2 if makefile_error
-          rebuilt = remake_includes(evalr, graph, opts, remade, precompleted)
+          rebuilt, include_error = remake_includes(evalr, graph, opts, remade, precompleted)
+          return 2 if include_error
           pass += 1
           break unless (remade_makefiles || rebuilt) && pass < 5
         end
@@ -93,7 +102,7 @@ module RMake
         end
 
         shell = Shell.new(opts[:dry_run], opts[:silent], opts[:ignore_errors])
-        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if], opts[:always_make])
+        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if], opts[:always_make], opts[:keep_going])
         begin
           if opts[:question]
             q = 0
@@ -104,10 +113,19 @@ module RMake
             end
             return q
           end
+          failed = false
           targets.each do |t|
             ok = exec.build_parallel(t, opts[:jobs])
-            return 2 unless ok
+            unless ok
+              if opts[:keep_going]
+                emit_error("#{make_prefix}: Target '#{t}' not remade because of errors.")
+                failed = true
+                next
+              end
+              return 2
+            end
           end
+          return 2 if failed
         rescue Evaluator::MakeError => e
           emit_error(e.message)
           return 2
@@ -316,7 +334,7 @@ module RMake
         reported_missing[mf] = true
       end
 
-      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
+      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if], opts[:always_make], opts[:keep_going])
       rebuilt = false
 
       candidates.each do |mf|
@@ -339,24 +357,36 @@ module RMake
 
     def self.remake_includes(evalr, graph, opts, remade, precompleted)
       includes = evalr.includes
-      return false if includes.nil? || includes.empty?
+      return [false, false] if includes.nil? || includes.empty?
 
-      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], nil, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
+      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], nil, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if], opts[:always_make], opts[:keep_going])
       rebuilt = false
-      includes.each do |path, optional|
+      includes.each do |entry|
+        path = entry && entry[0]
+        optional = entry && entry[1]
+        src_file = entry && entry[2]
+        src_line = entry && entry[3]
         next if path.nil? || path.empty?
         next if remade && remade[path]
         next unless exec.can_build?(path)
+        if opts[:keep_going] && !optional && !File.exist?(path) && src_file && !src_file.to_s.empty? && src_line && src_line.to_i > 0
+          emit_error("#{src_file}:#{src_line}: #{path}: No such file or directory")
+        end
         if File.exist?(path) && !exec.needs_build?(path)
           next
         end
         ok = exec.build_parallel(path, opts[:jobs])
-        return false unless ok
+        unless ok
+          if src_file && !src_file.to_s.empty? && src_line && src_line.to_i > 0
+            emit_error("#{src_file}:#{src_line}: failed to remake makefile '#{path}'")
+          end
+          return [rebuilt, true]
+        end
         remade[path] = true if remade
         mark_precompleted(precompleted, path) if precompleted
         rebuilt = true
       end
-      rebuilt
+      [rebuilt, false]
     end
 
     def self.mark_precompleted(precompleted, path)
@@ -698,6 +728,16 @@ module RMake
           jobs_set = true
         end
       end
+
+      kg_flags = nil
+      kg_flags = cli_var_value(opts, "MAKEFLAGS")
+      kg_flags = cli_var_value(opts, "MFLAGS") if kg_flags.nil? || kg_flags.empty?
+      if kg_flags.nil? || kg_flags.empty?
+        kg_flags = env_var("MAKEFLAGS")
+        kg_flags = env_var("MFLAGS") if (kg_flags.nil? || kg_flags.empty?)
+      end
+      kg = keep_going_from_flags(kg_flags)
+      opts[:keep_going] = kg unless kg.nil?
 
       if opts[:include_path_flags].nil? || opts[:include_path_flags].empty?
         flags = cli_var_value(opts, "MAKEFLAGS")
@@ -1144,6 +1184,29 @@ module RMake
       out
     end
 
+    def self.keep_going_from_flags(flags)
+      return nil unless flags && !flags.empty?
+      out = nil
+      Util.split_ws(flags).each do |p|
+        token = p.to_s
+        if token == "-S" || token == "--no-keep-going"
+          out = false
+          next
+        end
+        if token == "-k" || token == "--keep-going"
+          out = true
+          next
+        end
+        if token_has_short_option?(token, "k")
+          out = true
+        end
+        if token_has_short_option?(token, "S")
+          out = false
+        end
+      end
+      out
+    end
+
     def self.mflags_for(opts)
       flags = []
       flags << "-j#{opts[:jobs]}" if opts[:jobs] > 1
@@ -1151,6 +1214,7 @@ module RMake
       flags << "-e" if opts[:env_override]
       flags << "-n" if opts[:dry_run]
       flags << "-q" if opts[:question]
+      flags << "-k" if opts[:keep_going]
       flags << "-r" if opts[:no_builtin_rules]
       flags << "-R" if opts[:no_builtin_variables]
       include_flags = opts[:include_path_flags] || []

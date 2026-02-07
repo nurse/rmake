@@ -112,7 +112,7 @@ module RMake
           optional, arg = inc
           files = Util.split_ws(expand(arg))
           files.each do |f|
-            @includes << [f, optional]
+            @includes << [f, optional, line.filename, line.lineno]
             include_file(f, optional, line)
           end
           next

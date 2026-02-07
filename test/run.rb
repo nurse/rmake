@@ -1193,6 +1193,56 @@ bye.mk.src:
   end
 end
 
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+      .SUFFIXES:
+
+      all: exe1 exe2; @echo making $@
+
+      exe1 exe2: lib; @echo cp $^ $@
+
+      lib: foo.o; @echo cp $^ $@
+
+      foo.o: ; exit 1
+    MK
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "-k"])
+        assert("keep-going shared dep returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("keep-going runs failing recipe", combined.include?("exit 1"))
+    assert("keep-going reports top target failure", combined.include?("Target 'all' not remade because of errors."))
+    assert("keep-going does not build sibling from failed shared dep", !combined.include?("cp lib exe2"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), <<~MK)
+      all: ; @echo hi
+      include ifile
+      ifile: no-such-file; exit 1
+    MK
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "-k"])
+        assert("include remake with keep-going returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    i1 = combined.index("ifile: No such file or directory")
+    i2 = combined.index("No rule to make target 'no-such-file', needed by 'ifile'.")
+    i3 = combined.index("failed to remake makefile 'ifile'")
+    assert("include missing message emitted", !i1.nil?)
+    assert("include missing dep message emitted", !i2.nil?)
+    assert("include remake-failed message emitted", !i3.nil?)
+    assert("include remake message order", i1 < i2 && i2 < i3)
+  end
+end
+
 failures = []
 tests.each_with_index do |t, i|
   begin
