@@ -14,8 +14,6 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: linux-x86_64
-          - os: macos-13
-            artifact: macos-x86_64
           - os: macos-14
             artifact: macos-arm64
           - os: windows-latest
