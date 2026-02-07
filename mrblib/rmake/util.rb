@@ -88,7 +88,22 @@ module RMake
       value = ctx[name]
       if value.nil?
         var = vars[name]
-        value = var ? (var.simple ? var.value : expand(var.value, vars, ctx)) : ""
+        if var
+          if var.simple
+            value = var.value
+          else
+            ctx2 = ctx ? ctx.dup : {}
+            if var.respond_to?(:file) && var.file && !var.file.to_s.empty?
+              ctx2["__def_file"] = var.file
+            end
+            if var.respond_to?(:line) && var.line && !var.line.to_s.empty?
+              ctx2["__def_line"] = var.line
+            end
+            value = expand(var.value, vars, ctx2)
+          end
+        else
+          value = ""
+        end
         if var.nil?
           envv = env_value(name)
           value = envv unless envv.nil?
@@ -237,6 +252,21 @@ module RMake
         a, b, c = split_func_args_all(args)
         cond = expand(a.to_s, vars, ctx)
         return cond.to_s.empty? ? expand(c.to_s, vars, ctx) : expand(b.to_s, vars, ctx)
+      when "and"
+        parts = split_func_args_all(args)
+        out = ""
+        parts.each do |p|
+          out = expand(p.to_s, vars, ctx)
+          return "" unless truthy_value?(out)
+        end
+        return out
+      when "or"
+        parts = split_func_args_all(args)
+        parts.each do |p|
+          out = expand(p.to_s, vars, ctx)
+          return out if truthy_value?(out)
+        end
+        return ""
       when "filter"
         a, b = split_func_args(args)
         patterns = split_ws(expand(a.to_s, vars, ctx))
@@ -281,11 +311,29 @@ module RMake
       when "firstword"
         words = split_ws(expand(args.to_s, vars, ctx))
         return words[0] || ""
+      when "lastword"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words[-1] || ""
       when "word"
         a, b = split_func_args(args)
-        idx = expand(a.to_s, vars, ctx).to_i
+        idx_raw = expand(a.to_s, vars, ctx)
+        idx = parse_index_arg(idx_raw, "word", "first", true, false, ctx)
         words = split_ws(expand(b.to_s, vars, ctx))
-        return idx <= 0 ? "" : (words[idx - 1] || "")
+        return words[idx - 1] || ""
+      when "words"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.length.to_s
+      when "wordlist"
+        a, b = split_func_args(args)
+        c, d = split_func_args(b)
+        start_raw = expand(a.to_s, vars, ctx)
+        end_raw = expand(c.to_s, vars, ctx)
+        start_idx = parse_index_arg(start_raw, "wordlist", "first", false, false, ctx)
+        end_idx = parse_index_arg(end_raw, "wordlist", "second", false, true, ctx)
+        words = split_ws(expand(d.to_s, vars, ctx))
+        return "" if end_idx < start_idx
+        seg = words[(start_idx - 1)..(end_idx - 1)]
+        return seg ? seg.join(" ") : ""
       when "wildcard"
         patterns = split_ws(expand(args.to_s, vars, ctx))
         matches = []
@@ -309,16 +357,56 @@ module RMake
       when "dir"
         words = split_ws(expand(args.to_s, vars, ctx))
         return words.map { |w| normalize_dir(w) }.join(" ")
+      when "basename"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.map { |w| basename_word(w) }.join(" ")
+      when "suffix"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.map { |w| suffix_word(w) }.join(" ")
+      when "join"
+        a, b = split_func_args(args)
+        wa = split_ws(expand(a.to_s, vars, ctx))
+        wb = split_ws(expand(b.to_s, vars, ctx))
+        max = wa.length > wb.length ? wa.length : wb.length
+        out = []
+        i = 0
+        while i < max
+          left = wa[i] || ""
+          right = wb[i] || ""
+          out << (left + right)
+          i += 1
+        end
+        return out.join(" ")
+      when "sort"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.uniq.sort.join(" ")
       when "value"
         name = expand(args.to_s, vars, ctx)
         var = vars[name]
         return var ? var.value.to_s : ""
+      when "flavor"
+        name = expand(args.to_s, vars, ctx).to_s.strip
+        var = vars[name]
+        return "undefined" if var.nil?
+        return var.simple ? "simple" : "recursive"
+      when "origin"
+        name = expand(args.to_s, vars, ctx).to_s.strip
+        return "automatic" if automatic_var_name?(name)
+        evaluator = ctx["__evaluator"]
+        if evaluator
+          begin
+            return evaluator.__send__(:origin_of, name)
+          rescue StandardError
+          end
+        end
+        return vars[name] ? "file" : "undefined"
       when "call"
         parts = split_func_args_all(args)
         name = expand(parts.shift.to_s, vars, ctx)
         var = vars[name]
         body = var ? var.value.to_s : ""
         ctx2 = ctx.dup
+        ctx2["0"] = name
         parts.each_with_index do |arg, i|
           ctx2[(i + 1).to_s] = expand(arg.to_s, vars, ctx)
         end
@@ -342,8 +430,93 @@ module RMake
           evaluator.send(:eval_text, eval_body.to_s)
         end
         return ""
+      when "warning"
+        msg = expand(args.to_s, vars, ctx)
+        msg = with_location_prefix(msg, ctx)
+        if Kernel.respond_to?(:warn)
+          warn msg
+        else
+          puts msg
+        end
+        return ""
+      when "error"
+        msg = expand(args.to_s, vars, ctx)
+        raise_make_error("#{msg}", ctx)
       end
       nil
+    end
+
+    def self.truthy_value?(value)
+      return false if value.nil?
+      !strip_ws(value.to_s).empty?
+    end
+
+    def self.with_location_prefix(msg, ctx, prefer_definition = false)
+      file = nil
+      line = nil
+      if prefer_definition && ctx
+        file = ctx["__def_file"]
+        line = ctx["__def_line"]
+      end
+      if file.nil? || file.to_s.empty? || line.nil? || line.to_s.empty?
+        file = ctx ? ctx["__file"] : nil
+        line = ctx ? ctx["__line"] : nil
+      end
+      return msg.to_s if file.nil? || file.to_s.empty? || line.nil? || line.to_s.empty?
+      "#{file}:#{line}: #{msg}"
+    end
+
+    def self.raise_make_error(msg, ctx, prefer_definition = false)
+      loc = with_location_prefix("", ctx, prefer_definition)
+      if loc.empty?
+        raise RMake::Evaluator::MakeError, "*** #{msg}.  Stop."
+      else
+        raise RMake::Evaluator::MakeError, "#{loc}*** #{msg}.  Stop."
+      end
+    end
+
+    LONG_MAX_STR = "9223372036854775807"
+
+    def self.parse_index_arg(raw, func_name, arg_name, special_word_zero, allow_zero, ctx)
+      text = raw.to_s
+      stripped = text.strip
+      if stripped.empty?
+        raise_make_error("invalid #{arg_name} argument to '#{func_name}' function: empty value", ctx, true)
+      end
+      unless digits_only?(stripped)
+        raise_make_error("invalid #{arg_name} argument to '#{func_name}' function: '#{text}'", ctx, true)
+      end
+      if out_of_range_int?(stripped)
+        raise_make_error("invalid #{arg_name} argument to '#{func_name}' function: '#{text}' out of range", ctx, true)
+      end
+      n = stripped.to_i
+      if n <= 0
+        return n if allow_zero && n == 0
+        if special_word_zero
+          raise_make_error("first argument to 'word' function must be greater than 0", ctx, true)
+        else
+          raise_make_error("invalid #{arg_name} argument to '#{func_name}' function: '#{text}'", ctx, true)
+        end
+      end
+      n
+    end
+
+    def self.out_of_range_int?(digits)
+      d = digits.to_s
+      return true if d.length > LONG_MAX_STR.length
+      return false if d.length < LONG_MAX_STR.length
+      d > LONG_MAX_STR
+    end
+
+    def self.digits_only?(str)
+      return false if str.nil? || str.empty?
+      i = 0
+      while i < str.length
+        c = str[i]
+        return false if c < "0" || c > "9"
+        i += 1
+      end
+      true
     end
 
     def self.match_pattern(word, pattern)
@@ -366,9 +539,57 @@ module RMake
       d
     end
 
+    def self.basename_word(word)
+      return "" if word.nil? || word.empty?
+      s = word.to_s
+      slash = s.rindex("/")
+      dot = s.rindex(".")
+      return s if dot.nil?
+      return s if slash && dot <= slash + 1
+      s[0...dot]
+    end
+
+    def self.suffix_word(word)
+      return "" if word.nil? || word.empty?
+      s = word.to_s
+      slash = s.rindex("/")
+      dot = s.rindex(".")
+      return "" if dot.nil?
+      return "" if slash && dot <= slash + 1
+      s[dot..-1].to_s
+    end
+
+    def self.automatic_var_name?(name)
+      return false if name.nil? || name.empty?
+      return true if %w[@ % < ? ^ + *].include?(name)
+      return true if %w[@D @F <D <F ?D ?F ^D ^F +D +F *D *F].include?(name)
+      false
+    end
+
     def self.strip_ws(str)
       return "" if str.nil?
       split_ws(str).join(" ")
+    end
+
+    LOCATION_MARK = "__RMAKE_LOC__\t"
+
+    def self.attach_location(cmd, file, line)
+      return cmd.to_s if file.nil? || file.to_s.empty? || line.nil?
+      "#{LOCATION_MARK}#{file}\t#{line}\t#{cmd}"
+    end
+
+    def self.extract_location(cmd)
+      s = cmd.to_s
+      return [nil, nil, s] unless s.start_with?(LOCATION_MARK)
+      rest = s[LOCATION_MARK.length..-1].to_s
+      i = rest.index("\t")
+      return [nil, nil, s] if i.nil?
+      j = rest.index("\t", i + 1)
+      return [nil, nil, s] if j.nil?
+      file = rest[0...i]
+      line = rest[(i + 1)...j]
+      body = rest[(j + 1)..-1].to_s
+      [file, line, body]
     end
 
     def self.shell_capture(cmd)

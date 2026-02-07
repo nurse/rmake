@@ -28,6 +28,7 @@ module RMake
       @lines = lines
       @rules = []
       @vars = {}
+      @origins = {}
       @overrides = {}
       @make_overrides = {}
       @includes = []
@@ -48,12 +49,16 @@ module RMake
       @target_pattern_order = []
       @exports = {}
       @cond_stack = []
+      @current_file = nil
+      @current_line = nil
       seed_env
     end
 
     def evaluate
       current_rules = []
       @lines.each do |line|
+        @current_file = line.filename
+        @current_line = line.lineno
         s = line.stripped
         next if s.nil? || s.empty?
 
@@ -67,7 +72,7 @@ module RMake
 
         if line.recipe
           if current_rules && !current_rules.empty?
-            recipe = Util.strip_leading_ws(line.raw)
+            recipe = Util.attach_location(Util.strip_leading_ws(line.raw), line.filename, line.lineno)
             current_rules.each { |rule| rule.recipe << recipe }
           end
           next
@@ -199,7 +204,7 @@ module RMake
             end
           end
           if inline && !inline.strip.empty?
-            recipe = Util.strip_leading_ws(inline)
+            recipe = Util.attach_location(Util.strip_leading_ws(inline), line.filename, line.lineno)
             current_rules.each { |rule_obj| rule_obj.recipe << recipe }
           end
           next
@@ -252,11 +257,14 @@ module RMake
 
     def set_override_with_op(name, op, value)
       @overrides[name] = true
+      assigned = false
       case op
       when ":=", "::="
         @vars[name] = Var.simple(expand(value.to_s))
+        assigned = true
       when ":::="
         @vars[name] = Var.recursive(recursive_immediate(value.to_s))
+        assigned = true
       when "+="
         prev = @vars[name]
         if prev
@@ -268,11 +276,17 @@ module RMake
         else
           @vars[name] = Var.recursive(value.to_s)
         end
+        assigned = true
       when "?="
-        @vars[name] ||= Var.recursive(value.to_s)
+        if @vars[name].nil?
+          @vars[name] = Var.recursive(value.to_s)
+          assigned = true
+        end
       else
         @vars[name] = Var.recursive(value.to_s)
+        assigned = true
       end
+      @origins[name] = "command line" if assigned
     end
 
     def merge!(ev)
@@ -287,6 +301,9 @@ module RMake
         @overrides[k] = true
       end
       @vars.merge!(ev.vars)
+      if ev.instance_variable_defined?(:@origins)
+        @origins.merge!(ev.instance_variable_get(:@origins))
+      end
       if ev.respond_to?(:target_vars)
         ev.target_vars.each do |t, vars|
           (@target_vars[t] ||= {}).merge!(vars)
@@ -314,23 +331,34 @@ module RMake
       end
     end
 
+    def set_env_var(name, value, override = false)
+      return if name.nil? || name.empty?
+      @vars[name] = Var.simple(value.to_s)
+      @origins[name] = override ? "environment override" : "environment"
+      @overrides[name] = true if override
+    end
+
+    def set_special_var(name, value, origin = "default")
+      return if name.nil? || name.empty?
+      @vars[name] = Var.simple(value.to_s)
+      @origins[name] = origin
+    end
+
     private
 
     def seed_env
-      @vars["CURDIR"] = Var.simple(Dir.pwd)
-      if Object.const_defined?(:ENV)
-        @vars["MAKE"] = Var.simple(ENV["MAKE"] || "make")
-        @vars["MFLAGS"] = Var.simple(ENV["MFLAGS"] || "")
-        @vars["mflags"] = Var.simple(@vars["MFLAGS"].value)
-        @vars["MAKECMDGOALS"] = Var.simple(ENV["MAKECMDGOALS"] || "")
-        @vars["SHELL"] = Var.simple(ENV["SHELL"] || "/bin/sh")
+      set_special_var("CURDIR", Dir.pwd, "file")
+      set_special_var("MAKE", "make", "default")
+      set_special_var("MFLAGS", "", "default")
+      set_special_var("mflags", "", "default")
+      set_special_var("MAKECMDGOALS", "", "default")
+      shell = if Object.const_defined?(:ENV) && ENV["SHELL"] && !ENV["SHELL"].empty?
+        ENV["SHELL"]
       else
-        @vars["MAKE"] = Var.simple("make")
-        @vars["MFLAGS"] = Var.simple("")
-        @vars["mflags"] = Var.simple("")
-        @vars["MAKECMDGOALS"] = Var.simple("")
-        @vars["SHELL"] = Var.simple("/bin/sh")
+        "/bin/sh"
       end
+      set_special_var("SHELL", shell, "default")
+      set_special_var("CC", "cc", "default")
     end
 
     def assign_var(name, op, value, force_override = false)
@@ -339,17 +367,22 @@ module RMake
         if envv && !envv.empty?
           @overrides[name] = true
           @vars[name] = Var.simple(envv)
+          @origins[name] = "environment override"
         end
       end
       return if @overrides[name] && !force_override
       return if @make_overrides[name] && !force_override
+      assigned = false
       case op
       when "="
-        @vars[name] = Var.recursive(value)
+        @vars[name] = Var.recursive(value, @current_file, @current_line)
+        assigned = true
       when ":=", "::="
-        @vars[name] = Var.simple(expand(value))
+        @vars[name] = Var.simple(expand(value), @current_file, @current_line)
+        assigned = true
       when ":::="
-        @vars[name] = Var.recursive(recursive_immediate(value))
+        @vars[name] = Var.recursive(recursive_immediate(value), @current_file, @current_line)
+        assigned = true
       when "+="
         prev = @vars[name]
         if prev.nil?
@@ -361,19 +394,27 @@ module RMake
         end
         if prev
           if prev.simple
-            @vars[name] = Var.simple(append_with_space(prev.value, expand(value)))
+            @vars[name] = Var.simple(append_with_space(prev.value, expand(value)), @current_file, @current_line)
           else
-            @vars[name] = Var.recursive(append_with_space(prev.value, value))
+            @vars[name] = Var.recursive(append_with_space(prev.value, value), @current_file, @current_line)
           end
         else
-          @vars[name] = Var.recursive(value)
+          @vars[name] = Var.recursive(value, @current_file, @current_line)
         end
+        assigned = true
       when "?="
-        @vars[name] ||= Var.recursive(value)
+        if @vars[name].nil?
+          @vars[name] = Var.recursive(value, @current_file, @current_line)
+          assigned = true
+        end
       else
-        @vars[name] = Var.recursive(value)
+        @vars[name] = Var.recursive(value, @current_file, @current_line)
+        assigned = true
       end
       @make_overrides[name] = true if force_override
+      if assigned
+        @origins[name] = force_override ? "override" : "file"
+      end
     end
 
     def assign_target_var(target, name, op, value, force_override = false)
@@ -587,6 +628,9 @@ module RMake
           extra = Parser.new(io, path).parse
           Evaluator.new(extra).tap do |ev|
             ev.vars.merge!(@vars)
+            if ev.instance_variable_defined?(:@origins)
+              ev.instance_variable_get(:@origins).merge!(@origins)
+            end
             ev.instance_variable_get(:@overrides).merge!(@overrides)
             ev.evaluate
             merge!(ev)
@@ -604,15 +648,36 @@ module RMake
       extra = Parser.new(io, "<eval>").parse
       Evaluator.new(extra).tap do |ev|
         ev.vars.merge!(@vars)
+        if ev.instance_variable_defined?(:@origins)
+          ev.instance_variable_get(:@origins).merge!(@origins)
+        end
         ev.instance_variable_get(:@overrides).merge!(@overrides)
         ev.evaluate
         merge!(ev)
       end
     end
 
+    def origin_of(name)
+      return "undefined" if name.nil? || name.empty?
+      return "automatic" if Util.automatic_var_name?(name)
+      origin = @origins[name]
+      return origin if origin
+      envv = env_var(name)
+      unless envv.nil?
+        return @env_override ? "environment override" : "environment"
+      end
+      "undefined"
+    end
+
     def expand(str, ctx = {})
       ctx = ctx ? ctx.dup : {}
       ctx["__evaluator"] = self
+      if @current_file && (ctx["__file"].nil? || ctx["__file"].to_s.empty?)
+        ctx["__file"] = @current_file
+      end
+      if @current_line && (ctx["__line"].nil? || ctx["__line"].to_s.empty?)
+        ctx["__line"] = @current_line
+      end
       Util.expand(str, @vars, ctx)
     end
 
@@ -917,19 +982,21 @@ module RMake
     end
 
     class Var
-      attr_reader :value, :simple
+      attr_reader :value, :simple, :file, :line
 
-      def initialize(value, simple)
+      def initialize(value, simple, file = nil, line = nil)
         @value = value
         @simple = simple
+        @file = file
+        @line = line
       end
 
-      def self.simple(value)
-        new(value, true)
+      def self.simple(value, file = nil, line = nil)
+        new(value, true, file, line)
       end
 
-      def self.recursive(value)
-        new(value, false)
+      def self.recursive(value, file = nil, line = nil)
+        new(value, false, file, line)
       end
     end
   end

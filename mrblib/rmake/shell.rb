@@ -11,8 +11,14 @@ module RMake
 
     def run(cmd, vars, env_vars = nil)
       env_vars ||= {}
-      base_silent, base_ignore, base_force, body = Util.strip_cmd_prefixes(cmd.to_s)
-      expanded = Util.expand(body, vars, env_vars)
+      loc_file, loc_line, raw_cmd = Util.extract_location(cmd.to_s)
+      expand_ctx = env_vars.dup
+      if loc_file && !loc_file.empty?
+        expand_ctx["__file"] = loc_file
+        expand_ctx["__line"] = loc_line
+      end
+      base_silent, base_ignore, base_force, body = Util.strip_cmd_prefixes(raw_cmd.to_s)
+      expanded = Util.expand(body, vars, expand_ctx)
       return [true, false] if expanded.nil? || expanded.strip.empty?
       ran = false
       expanded.split("\n", -1).each do |line|
@@ -33,7 +39,55 @@ module RMake
         ok, status = run_command(exec_cmd)
         unless ok
           if ignore_fail
-            emit_ignored_error(env_vars, status, vars)
+            emit_ignored_error(expand_ctx, status, vars)
+            ran = true
+            next
+          end
+          return [false, true]
+        end
+        ran = true
+      end
+      [true, ran]
+    end
+
+    def run_recipe(recipe, vars, env_vars = nil)
+      env_vars ||= {}
+      prepared = []
+      recipe.each do |raw|
+        loc_file, loc_line, recipe_line = Util.extract_location(raw.to_s)
+        expand_ctx = env_vars.dup
+        if loc_file && !loc_file.empty?
+          expand_ctx["__file"] = loc_file
+          expand_ctx["__line"] = loc_line
+        end
+        base_silent, base_ignore, base_force, body = Util.strip_cmd_prefixes(recipe_line.to_s)
+        expanded = Util.expand(body, vars, expand_ctx)
+        next if expanded.nil? || expanded.strip.empty?
+        expanded.split("\n", -1).each do |line|
+          silent, ignore_fail, force, line_cmd = Util.strip_cmd_prefixes(line.to_s)
+          silent ||= base_silent
+          ignore_fail ||= base_ignore
+          force ||= base_force
+          next if line_cmd.nil? || line_cmd.strip.empty?
+          recursive = force || recursive_make_cmd?(line_cmd, vars)
+          force = true if recursive
+          exec_cmd = with_makelevel(line_cmd, vars, recursive)
+          prepared << [line_cmd, exec_cmd, silent, ignore_fail, force, expand_ctx]
+        end
+      end
+
+      ran = false
+      prepared.each do |line_cmd, exec_cmd, silent, ignore_fail, force, expand_ctx|
+        if @dry_run && !force
+          puts line_cmd
+          ran = true
+          next
+        end
+        puts line_cmd unless silent || @silent
+        ok, status = run_command(exec_cmd)
+        unless ok
+          if ignore_fail
+            emit_ignored_error(expand_ctx, status, vars)
             ran = true
             next
           end
@@ -48,7 +102,13 @@ module RMake
       env_vars ||= {}
       script = +"set -e\n"
       node.recipe.each do |raw|
-        expanded = Util.expand(raw, vars, env_vars)
+        loc_file, loc_line, recipe = Util.extract_location(raw.to_s)
+        expand_ctx = env_vars.dup
+        if loc_file && !loc_file.empty?
+          expand_ctx["__file"] = loc_file
+          expand_ctx["__line"] = loc_line
+        end
+        expanded = Util.expand(recipe, vars, expand_ctx)
         silent, ignore_fail, force, expanded = Util.strip_cmd_prefixes(expanded)
         next if expanded.nil? || expanded.strip.empty?
         recursive = force || recursive_make_cmd?(expanded, vars)
@@ -60,7 +120,7 @@ module RMake
         end
         script << "echo #{escape_sh(expanded)}\n" unless silent || @silent
         if ignore_fail
-          prefix = ignored_error_prefix(env_vars, vars).gsub("\"", "\\\"")
+          prefix = ignored_error_prefix(expand_ctx, vars).gsub("\"", "\\\"")
           script << "if /bin/sh -c #{escape_sh(exec_cmd)}; then :; else __rmake_status=$?; "
           script << "echo \"#{prefix}$__rmake_status (ignored)\"; "
           script << "fi\n"

@@ -1,9 +1,10 @@
 module RMake
   class Executor
-    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false)
+    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil)
       @graph = graph
       @shell = shell
       @vars = vars
+      @evaluator = evaluator
       @delete_on_error = delete_on_error
       @trace = trace
       @suffixes = suffixes || []
@@ -323,13 +324,7 @@ module RMake
     def run_recipe(node, deps = nil, vars_override = nil)
       ctx = auto_vars(node, deps)
       vars = vars_override || vars_for(node)
-      executed = false
-      node.recipe.each do |raw|
-        ok, did_run = @shell.run(raw, vars, ctx)
-        executed ||= did_run
-        return [false, executed] unless ok
-      end
-      [true, executed]
+      @shell.run_recipe(node.recipe, vars, ctx)
     end
 
     def recipe_executes?(node, deps = nil)
@@ -354,6 +349,7 @@ module RMake
       end
       newer = uniq_words(newer)
       {
+        "__evaluator" => @evaluator,
         "@" => node.name,
         "<" => first,
         "<D" => dirpart(first),
@@ -673,6 +669,7 @@ module RMake
     def prereq_expand_ctx(node)
       stem = target_stem(node.name)
       {
+        "__evaluator" => @evaluator,
         "@" => node.name,
         "@D" => dirpart(node.name),
         "@F" => File.basename(node.name),

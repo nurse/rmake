@@ -91,19 +91,28 @@ module RMake
         end
 
         shell = Shell.new(opts[:dry_run], opts[:silent])
-        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?)
-        if opts[:question]
-          q = 0
-          targets.each do |t|
-            st = exec.question_status(t)
-            return 2 if st == 2
-            q = 1 if st == 1
+        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr)
+        begin
+          if opts[:question]
+            q = 0
+            targets.each do |t|
+              st = exec.question_status(t)
+              return 2 if st == 2
+              q = 1 if st == 1
+            end
+            return q
           end
-          return q
-        end
-        targets.each do |t|
-          ok = exec.build_parallel(t, opts[:jobs])
-          return 2 unless ok
+          targets.each do |t|
+            ok = exec.build_parallel(t, opts[:jobs])
+            return 2 unless ok
+          end
+        rescue Evaluator::MakeError => e
+          if Kernel.respond_to?(:warn)
+            warn e.message
+          else
+            puts e.message
+          end
+          return 2
         end
         emit_nothing_to_do(targets, opts, graph) if !opts[:trace] && !exec.built_any?
         0
@@ -208,7 +217,7 @@ module RMake
       includes = evalr.includes
       return false if includes.nil? || includes.empty?
 
-      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], nil, evalr.suffixes, evalr.second_expansion?)
+      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], nil, evalr.suffixes, evalr.second_expansion?, evalr)
       rebuilt = false
       includes.each do |path, optional|
         next if path.nil? || path.empty?
@@ -240,7 +249,7 @@ module RMake
       missing = []
       checker = nil
       if opts[:dry_run]
-        checker = Executor.new(graph, Shell.new(true, opts[:silent]), evalr.vars, evalr.delete_on_error?, false, nil, evalr.suffixes, evalr.second_expansion?)
+        checker = Executor.new(graph, Shell.new(true, opts[:silent]), evalr.vars, evalr.delete_on_error?, false, nil, evalr.suffixes, evalr.second_expansion?, evalr)
       end
       evalr.missing_required.each do |path|
         next if path.nil? || path.empty?
@@ -433,7 +442,7 @@ module RMake
     end
 
     def self.set_make_vars(evalr, make_cmd, opts)
-      evalr.vars["MAKE"] = Evaluator::Var.simple(make_cmd)
+      evalr.set_special_var("MAKE", make_cmd, "default")
       flags = []
       flags << "-j#{opts[:jobs]}" if opts[:jobs] > 1
       flags << "-s" if opts[:silent]
@@ -441,15 +450,15 @@ module RMake
       flags << "-n" if opts[:dry_run]
       flags << "-q" if opts[:question]
       flags = flags.join(" ").strip
-      evalr.vars["MFLAGS"] = Evaluator::Var.simple(flags)
-      evalr.vars["mflags"] = Evaluator::Var.simple(flags)
-      evalr.vars["MAKEFLAGS"] = Evaluator::Var.simple(flags)
-      evalr.vars["MAKECMDGOALS"] = Evaluator::Var.simple(explicit_targets(opts).join(" "))
+      evalr.set_special_var("MFLAGS", flags, "default")
+      evalr.set_special_var("mflags", flags, "default")
+      evalr.set_special_var("MAKEFLAGS", flags, "default")
+      evalr.set_special_var("MAKECMDGOALS", explicit_targets(opts).join(" "), "default")
       unless cli_var_assigned?(opts, "MAKELEVEL")
         level = 0
         env_level = env_var("MAKELEVEL")
         level = env_level.to_i if env_level && !env_level.empty?
-        evalr.vars["MAKELEVEL"] = Evaluator::Var.simple(level.to_s)
+        evalr.set_special_var("MAKELEVEL", level.to_s, "default")
       end
     end
 
@@ -590,16 +599,38 @@ module RMake
     end
 
     def self.apply_env_vars(evalr, opts)
-      return unless Object.const_defined?(:ENV)
-      ENV.each_pair do |k, v|
+      env_pairs.each do |k, v|
         next if k.nil? || k.empty?
         next if k == "PWD"
         if opts[:env_override]
-          evalr.set_override_with_op(k, "=", v.to_s)
+          evalr.set_env_var(k, v.to_s, true)
         else
-          evalr.vars[k] = Evaluator::Var.simple(v.to_s) unless evalr.vars.key?(k)
+          evalr.set_env_var(k, v.to_s, false) unless evalr.vars.key?(k)
         end
       end
+    end
+
+    def self.env_pairs
+      out = []
+      if Object.const_defined?(:ENV)
+        if ENV.respond_to?(:each_pair)
+          ENV.each_pair { |k, v| out << [k, v] }
+          return out
+        elsif ENV.respond_to?(:each)
+          ENV.each { |k, v| out << [k, v] }
+          return out
+        end
+      end
+      return out unless Util.respond_to?(:shell_capture)
+      raw = Util.shell_capture("printenv | tr '\\n' '\\t'")
+      return out if raw.nil? || raw.empty?
+      raw.split("\t").each do |line|
+        next if line.nil? || line.empty?
+        i = line.index("=")
+        next if i.nil? || i <= 0
+        out << [line[0...i], line[(i + 1)..-1].to_s]
+      end
+      out
     end
 
     def self.parse_cli_assignment(arg)
