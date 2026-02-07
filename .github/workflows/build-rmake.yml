@@ -32,11 +32,25 @@ jobs:
         with:
           ruby-version: "3.2"
 
-      - name: Build rmake
+      - name: Build rmake (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           ruby tools/build_rmake.rb
           ls -la dist
+
+      - name: Setup MSYS2 toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ridk exec pacman --noconfirm -S --needed make mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build rmake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ridk exec ruby tools/build_rmake.rb
+          Get-ChildItem dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
