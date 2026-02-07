@@ -30,6 +30,7 @@ module RMake
         recursive = force || recursive_make_cmd?(line_cmd, vars)
         force = true if recursive
         exec_cmd = with_makelevel(line_cmd, vars, recursive)
+        exec_cmd = apply_recipe_exports(exec_cmd, vars)
         if @dry_run && !force
           puts line_cmd
           ran = true
@@ -72,6 +73,7 @@ module RMake
           recursive = force || recursive_make_cmd?(line_cmd, vars)
           force = true if recursive
           exec_cmd = with_makelevel(line_cmd, vars, recursive)
+          exec_cmd = apply_recipe_exports(exec_cmd, vars)
           prepared << [line_cmd, exec_cmd, silent, ignore_fail, force, expand_ctx]
         end
       end
@@ -114,6 +116,7 @@ module RMake
         recursive = force || recursive_make_cmd?(expanded, vars)
         force = true if recursive
         exec_cmd = with_makelevel(expanded, vars, recursive)
+        exec_cmd = apply_recipe_exports(exec_cmd, vars)
         if @dry_run && !force
           puts expanded
           next
@@ -221,6 +224,26 @@ module RMake
       var = vars[name]
       return nil unless var
       var.simple ? var.value.to_s : Util.expand(var.value.to_s, vars, {})
+    end
+
+    def apply_recipe_exports(cmd, vars)
+      return cmd if vars.nil?
+      exports = var_value(vars, "__RMAKE_EXPORTS__")
+      return cmd if exports.nil? || exports.empty?
+      names = Util.split_ws(exports)
+      return cmd if names.empty?
+      assigns = []
+      names.each do |name|
+        next if name.nil? || name.empty?
+        val = var_value(vars, name)
+        if (val.nil? || val.empty?) && Object.const_defined?(:ENV)
+          val = ENV[name]
+        end
+        next if val.nil?
+        assigns << "#{name}=#{Util.shell_escape(val.to_s)}"
+      end
+      return cmd if assigns.empty?
+      "env #{assigns.join(' ')} /bin/sh -c #{Util.shell_escape(cmd)}"
     end
 
     def recursive_make_cmd?(cmd, vars)

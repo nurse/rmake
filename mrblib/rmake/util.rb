@@ -134,6 +134,7 @@ module RMake
 
     def self.split_ws(str)
       return [] if str.nil?
+      return [] if str.empty?
       return [str] if str.index(" ").nil? && str.index("\t").nil? && str.index("\n").nil? && str.index("\r").nil?
       out = []
       cur = ""
@@ -344,13 +345,22 @@ module RMake
         # Fallback to shell expansion when Dir.glob is unavailable (mruby).
         patterns.each do |pat|
           if pat.include?("*") || pat.include?("?") || pat.include?("[")
-            out = shell_capture("ls -1 #{pat} 2>/dev/null")
-            matches.concat(split_ws(out))
+            out = shell_capture("for p in #{pat}; do [ -e \"$p\" ] && printf '%s\\t' \"$p\"; done 2>/dev/null")
+            out.to_s.split("\t").each do |m|
+              next if m.nil? || m.empty?
+              matches << m
+            end
           elsif File.exist?(pat)
             matches << pat
           end
         end
         return matches.join(" ")
+      when "abspath"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.map { |w| abs_word(w) }.join(" ")
+      when "realpath"
+        words = split_ws(expand(args.to_s, vars, ctx))
+        return words.map { |w| real_word(w) }.reject { |w| w.nil? || w.empty? }.join(" ")
       when "notdir"
         words = split_ws(expand(args.to_s, vars, ctx))
         return words.map { |w| File.basename(w) }.join(" ")
@@ -521,13 +531,56 @@ module RMake
 
     def self.match_pattern(word, pattern)
       return false if pattern.nil?
-      if pattern.include?("%")
-        parts = pattern.split("%", 2)
-        pre = parts[0]
-        post = parts[1] || ""
-        return word.start_with?(pre) && word.end_with?(post)
+      tokens = parse_pattern_tokens(pattern.to_s)
+      match_pattern_tokens(word.to_s, tokens, 0, 0)
+    end
+
+    def self.parse_pattern_tokens(pattern)
+      out = []
+      lit = ""
+      i = 0
+      while i < pattern.length
+        c = pattern[i]
+        if c == "\\"
+          n = pattern[i + 1]
+          if n == "%" || n == "\\"
+            lit << n
+            i += 2
+            next
+          end
+          lit << "\\"
+          i += 1
+          next
+        end
+        if c == "%"
+          out << lit
+          out << :wild
+          lit = ""
+          i += 1
+          next
+        end
+        lit << c
+        i += 1
       end
-      word == pattern
+      out << lit
+      out
+    end
+
+    def self.match_pattern_tokens(word, tokens, wi, ti)
+      return wi == word.length if ti >= tokens.length
+      tok = tokens[ti]
+      if tok == :wild
+        j = wi
+        while j <= word.length
+          return true if match_pattern_tokens(word, tokens, j, ti + 1)
+          j += 1
+        end
+        return false
+      end
+      lit = tok.to_s
+      return false if wi + lit.length > word.length
+      return false unless word[wi, lit.length] == lit
+      match_pattern_tokens(word, tokens, wi + lit.length, ti + 1)
     end
 
     def self.normalize_dir(word)
@@ -537,6 +590,26 @@ module RMake
       d = "./" if d == "."
       d = "#{d}/" unless d.end_with?("/")
       d
+    end
+
+    def self.abs_word(word)
+      return "" if word.nil? || word.empty?
+      File.expand_path(word.to_s)
+    rescue StandardError
+      ""
+    end
+
+    def self.real_word(word)
+      return "" if word.nil? || word.empty?
+      path = abs_word(word.to_s)
+      return "" if path.nil? || path.empty?
+      if File.respond_to?(:realpath)
+        return File.realpath(path)
+      end
+      return "" unless File.exist?(path)
+      path
+    rescue StandardError
+      ""
     end
 
     def self.basename_word(word)
