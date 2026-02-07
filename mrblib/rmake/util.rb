@@ -317,6 +317,26 @@ module RMake
         return "" if end_idx < start_idx
         seg = words[(start_idx - 1)..(end_idx - 1)]
         return seg ? seg.join(" ") : ""
+      when "intcmp"
+        parts = split_func_args_all(args)
+        return "" if parts.length < 2
+        left_raw = expand(parts[0].to_s, vars, ctx)
+        right_raw = expand(parts[1].to_s, vars, ctx)
+        left_num = parse_intcmp_arg(left_raw, "first", ctx)
+        right_num = parse_intcmp_arg(right_raw, "second", ctx)
+        cmp = compare_bigints(left_num, right_num)
+        case parts.length
+        when 2
+          return cmp == 0 ? bigint_to_s(left_num) : ""
+        when 3
+          return cmp < 0 ? expand(parts[2].to_s, vars, ctx) : ""
+        when 4
+          return cmp < 0 ? expand(parts[2].to_s, vars, ctx) : expand(parts[3].to_s, vars, ctx)
+        else
+          return expand(parts[2].to_s, vars, ctx) if cmp < 0
+          return expand(parts[3].to_s, vars, ctx) if cmp == 0
+          return expand(parts[4].to_s, vars, ctx)
+        end
       when "wildcard"
         patterns = split_ws(expand(args.to_s, vars, ctx))
         matches = []
@@ -384,6 +404,9 @@ module RMake
       when "origin"
         name = expand(args.to_s, vars, ctx).to_s.strip
         return "automatic" if automatic_var_name?(name)
+        if ctx && ctx.key?(name)
+          return "automatic"
+        end
         evaluator = ctx["__evaluator"]
         if evaluator
           begin
@@ -428,6 +451,33 @@ module RMake
           out << expand(text.to_s, vars, ctx2)
         end
         return out.join(" ")
+      when "let"
+        parts = split_func_args_all(args)
+        if parts.length < 3
+          raise_make_error("insufficient number of arguments (#{parts.length}) to function 'let'", ctx, true)
+        end
+        names = split_ws(expand(parts[0].to_s, vars, ctx))
+        list_text = expand(parts[1].to_s, vars, ctx).to_s
+        text = parts[2..-1].join(",")
+        ctx2 = ctx ? ctx.dup : {}
+        scan = 0
+        names.each_with_index do |name, i|
+          next if name.nil? || name.empty?
+          if i == names.length - 1
+            scan += 1 while scan < list_text.length && whitespace_char?(list_text[scan])
+            ctx2[name] = list_text[scan..-1].to_s
+            next
+          end
+          scan += 1 while scan < list_text.length && whitespace_char?(list_text[scan])
+          if scan >= list_text.length
+            ctx2[name] = ""
+            next
+          end
+          start = scan
+          scan += 1 while scan < list_text.length && !whitespace_char?(list_text[scan])
+          ctx2[name] = list_text[start...scan].to_s
+        end
+        return expand(text.to_s, vars, ctx2)
       when "eval"
         eval_body = expand(args.to_s, vars, ctx)
         if ctx && ctx["@"]
@@ -478,6 +528,57 @@ module RMake
         return true unless rhs.empty?
       end
       false
+    end
+
+    def self.parse_intcmp_arg(raw, which, ctx)
+      text = raw.to_s
+      stripped = text.strip
+      if stripped.empty?
+        raise_make_error("non-numeric #{which} argument to 'intcmp' function: empty value", ctx)
+      end
+      sign = 1
+      if stripped[0] == "+"
+        stripped = stripped[1..-1].to_s
+      elsif stripped[0] == "-"
+        sign = -1
+        stripped = stripped[1..-1].to_s
+      end
+      if stripped.empty? || !digits_only?(stripped)
+        raise_make_error("non-numeric #{which} argument to 'intcmp' function: '#{text}'", ctx)
+      end
+      i = 0
+      while i < stripped.length - 1 && stripped[i] == "0"
+        i += 1
+      end
+      digits = stripped[i..-1].to_s
+      sign = 1 if digits == "0"
+      [sign, digits]
+    end
+
+    def self.compare_bigints(a, b)
+      as, ad = a
+      bs, bd = b
+      return -1 if as < bs
+      return 1 if as > bs
+      if ad.length != bd.length
+        cmp = ad.length < bd.length ? -1 : 1
+        return as > 0 ? cmp : -cmp
+      end
+      if ad == bd
+        return 0
+      end
+      cmp = ad < bd ? -1 : 1
+      as > 0 ? cmp : -cmp
+    end
+
+    def self.bigint_to_s(num)
+      sign, digits = num
+      return digits if digits == "0" || sign >= 0
+      "-#{digits}"
+    end
+
+    def self.whitespace_char?(c)
+      c == " " || c == "\t" || c == "\n" || c == "\r"
     end
 
     def self.expand_var(var, vars, ctx)

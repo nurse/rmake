@@ -51,6 +51,7 @@ module RMake
       @cond_stack = []
       @current_file = nil
       @current_line = nil
+      @call_ctx = nil
       seed_env
     end
 
@@ -359,6 +360,7 @@ module RMake
       end
       set_special_var("SHELL", shell, "default")
       set_special_var("CC", "cc", "default")
+      set_special_var("AR", "ar", "default")
     end
 
     def assign_var(name, op, value, force_override = false)
@@ -649,11 +651,13 @@ module RMake
       Evaluator.new(extra).tap do |ev|
         ev.vars.merge!(@vars)
         if call_ctx
+          filtered = {}
           call_ctx.each do |k, v|
             next if k.nil? || k.empty?
             next if k.start_with?("__")
-            ev.vars[k] = Var.simple(v.to_s)
+            filtered[k] = v.to_s
           end
+          ev.instance_variable_set(:@call_ctx, filtered)
         end
         if ev.instance_variable_defined?(:@origins)
           ev.instance_variable_get(:@origins).merge!(@origins)
@@ -679,6 +683,11 @@ module RMake
     def expand(str, ctx = {})
       ctx = ctx ? ctx.dup : {}
       ctx["__evaluator"] = self
+      if @call_ctx
+        @call_ctx.each do |k, v|
+          ctx[k] = v unless ctx.key?(k)
+        end
+      end
       if @current_file && (ctx["__file"].nil? || ctx["__file"].to_s.empty?)
         ctx["__file"] = @current_file
       end
