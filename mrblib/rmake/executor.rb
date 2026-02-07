@@ -1,6 +1,6 @@
 module RMake
   class Executor
-    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil, touch = false, what_if = nil)
+    def initialize(graph, shell, vars, delete_on_error = false, trace = false, precompleted = nil, suffixes = nil, second_expansion = false, evaluator = nil, touch = false, what_if = nil, always_make = false)
       @graph = graph
       @shell = shell
       @vars = vars
@@ -8,6 +8,7 @@ module RMake
       @delete_on_error = delete_on_error
       @trace = trace
       @touch = !!touch
+      @always_make = !!always_make
       @what_if = {}
       (what_if || []).each do |w|
         next if w.nil? || w.empty?
@@ -80,6 +81,7 @@ module RMake
         end
         restat_update(node.name, old_mtime)
         @built_phony[key] = true if node.phony
+        mark_group_built(node, executed)
       else
         puts "rmake: #{node.name} (skip)" if @trace
       end
@@ -146,15 +148,20 @@ module RMake
               cleanup_target(node)
               return false
             end
+            restat_update(node.name, run_old[node.name])
             @built_phony[node.name] = true if node.phony
             @building[node.name] = :done
             mark_done(node.name, done, pending, reverse, plan, ready)
+            mark_group_built(node, executed)
+            mark_group_done_in_plan(node, done, pending, reverse, plan, ready)
           else
             pid = @shell.spawn_recipe(node, node_vars, auto_vars(node, deps))
             if pid == 0
               @built_phony[node.name] = true if node.phony
               @building[node.name] = :done
               mark_done(node.name, done, pending, reverse, plan, ready)
+              mark_group_built(node, true)
+              mark_group_done_in_plan(node, done, pending, reverse, plan, ready)
             else
               running[pid] = node
             end
@@ -172,6 +179,8 @@ module RMake
           @built_phony[node.name] = true if node.phony
           @building[node.name] = :done
           mark_done(node.name, done, pending, reverse, plan, ready)
+          mark_group_built(node, true)
+          mark_group_done_in_plan(node, done, pending, reverse, plan, ready)
         end
 
         if running.empty? && ready.empty?
@@ -310,6 +319,11 @@ module RMake
           return imp
         end
       end
+      pat = @graph.pattern_rule_node_for(name)
+      if pat
+        @node_cache[name] = pat
+        return pat
+      end
       # Built-in implicit for assembly
       if !no_builtin_rules && name.end_with?(".o")
         base = name[0...-2]
@@ -340,10 +354,12 @@ module RMake
         return false if @built_phony[node.name]
         return false if node.recipe.nil? || node.recipe.empty?
         return false unless @touch || recipe_executes_with_vars?(node, deps, vars_override)
+        return true if @always_make
         return true
       end
       return false if node.recipe.nil? || node.recipe.empty?
       return false unless @touch || recipe_executes_with_vars?(node, deps, vars_override)
+      return true if @always_make
       deps.each do |dep|
         dep_node = @graph.node(dep)
         return true if dep_node && dep_node.phony
@@ -397,35 +413,60 @@ module RMake
     end
 
     def touch_target(node)
+      puts "touch #{node.name}"
       if @shell.respond_to?(:dry_run?) && @shell.dry_run?
-        puts "touch #{node.name}"
         return [true, true]
       end
       begin
         File.open(node.name, "a") { |_| }
+        ok = execute_touch_command(node.name)
+        return [ok, true] unless ok.nil?
         if File.respond_to?(:utime)
           now = Time.now
           File.utime(now, now, node.name)
         end
         [true, true]
       rescue StandardError
+        ok = execute_touch_command(node.name)
+        return [ok, true] unless ok.nil?
         [false, true]
       end
+    end
+
+    def execute_touch_command(path)
+      cmd = "touch #{Util.shell_escape(path)}"
+      if @shell && @shell.respond_to?(:send)
+        begin
+          ok, _status = @shell.send(:run_command, cmd)
+          return ok ? true : false
+        rescue StandardError
+          # fallback below
+        end
+      end
+      if Kernel.respond_to?(:system)
+        ok = system(cmd)
+        return ok ? true : false
+      end
+      nil
     end
 
     def auto_vars(node, deps = nil)
       deps ||= expanded_prereqs(node).first
       prereqs = deps.map { |d| resolve_path(d) || d }
       first = prereqs.first || ""
-      stem = target_stem(node.name)
+      stem = node_stem(node)
       stem_dir = dirpart(stem)
       uniq_prereqs = uniq_words(prereqs)
       tgt_mtime = mtime(node.name)
-      newer = prereqs.select do |path|
-        dep_mtime = mtime(path)
-        tgt_mtime.nil? || dep_mtime.nil? || dep_mtime > tgt_mtime
+      if @always_make
+        newer = uniq_prereqs
+      else
+        newer = prereqs.select do |path|
+          dep_mtime = mtime(path)
+          tgt_mtime.nil? || dep_mtime.nil? || dep_mtime > tgt_mtime
+        end
+        newer = uniq_words(newer)
       end
-      newer = uniq_words(newer)
       {
         "__evaluator" => @evaluator,
         "@" => node.name,
@@ -762,7 +803,7 @@ module RMake
     end
 
     def prereq_expand_ctx(node)
-      stem = target_stem(node.name)
+      stem = node_stem(node)
       {
         "__evaluator" => @evaluator,
         "@" => node.name,
@@ -817,6 +858,36 @@ module RMake
       end
       return "" if matched.nil?
       name[0...-matched.length]
+    end
+
+    def node_stem(node)
+      if node && node.respond_to?(:pattern_stem)
+        s = node.pattern_stem
+        return s.to_s unless s.nil? || s.to_s.empty?
+      end
+      target_stem(node ? node.name : "")
+    end
+
+    def mark_group_built(node, executed)
+      return unless node && node.respond_to?(:grouped) && node.grouped
+      peers = node.group_peers || []
+      peers.each do |peer|
+        @building[peer] = :done
+        @built_phony[peer] = true if node.phony
+        if @shell.respond_to?(:dry_run?) && @shell.dry_run? && executed && !node.phony
+          @pretend_updated[peer] = true
+        end
+      end
+    end
+
+    def mark_group_done_in_plan(node, done, pending, reverse, plan, ready)
+      return unless node && node.respond_to?(:grouped) && node.grouped
+      peers = node.group_peers || []
+      peers.each do |peer|
+        next unless plan.key?(peer)
+        next if done[peer]
+        mark_done(peer, done, pending, reverse, plan, ready)
+      end
     end
 
     def seed_precompleted(precompleted)

@@ -47,7 +47,14 @@ module RMake
         else
           puts line_cmd unless silent || @silent
         end
+        print_dirs = recursive && print_directory_for_recursive?(vars)
+        if print_dirs
+          puts "#{recursive_make_prefix(vars)}: Entering directory '#{Dir.pwd}'"
+        end
         ok, status = run_command(exec_cmd)
+        if print_dirs
+          puts "#{recursive_make_prefix(vars)}: Leaving directory '#{Dir.pwd}'"
+        end
         unless ok
           if ignore_fail
             emit_ignored_error(expand_ctx, status, vars)
@@ -101,7 +108,14 @@ module RMake
         else
           puts line_cmd unless silent || @silent
         end
+        print_dirs = recursive_make_cmd?(line_cmd, vars) && print_directory_for_recursive?(vars)
+        if print_dirs
+          puts "#{recursive_make_prefix(vars)}: Entering directory '#{Dir.pwd}'"
+        end
         ok, status = run_command(exec_cmd)
+        if print_dirs
+          puts "#{recursive_make_prefix(vars)}: Leaving directory '#{Dir.pwd}'"
+        end
         unless ok
           if ignore_fail
             emit_ignored_error(expand_ctx, status, vars)
@@ -261,6 +275,74 @@ module RMake
       end
       parts << cli_assigns if cli_assigns && !cli_assigns.empty?
       parts.join(" ")
+    end
+
+    def recursive_make_prefix(vars)
+      base = "make"
+      mk = nil
+      if Object.const_defined?(:ENV)
+        mk = ENV["MAKE"]
+      end
+      mk = var_value(vars, "MAKE") if (mk.nil? || mk.empty?) && vars
+      if mk && !mk.empty?
+        token = Util.split_ws(mk).first
+        base = File.basename(token) if token && !token.empty?
+      end
+      level = 0
+      if Object.const_defined?(:ENV)
+        lv = ENV["MAKELEVEL"]
+        level = lv.to_i if lv && !lv.empty?
+      end
+      if level == 0
+        lv = var_value(vars, "MAKELEVEL")
+        level = lv.to_i if lv && !lv.empty?
+      end
+      level += 1
+      "#{base}[#{level}]"
+    end
+
+    def print_directory_for_recursive?(vars)
+      flags = nil
+      if Object.const_defined?(:ENV)
+        flags = ENV["MAKEFLAGS"]
+      end
+      flags = var_value(vars, "MAKEFLAGS") if (flags.nil? || flags.empty?) && vars
+      flags = var_value(vars, "MFLAGS") if (flags.nil? || flags.empty?) && vars
+      return false if flags_include_silent?(flags)
+      return false if flags && flags.include?("--no-print-directory")
+      return true if flags && (flags.include?("-w") || flags.include?("--print-directory"))
+      true
+    end
+
+    def flags_include_silent?(flags)
+      return false if flags.nil? || flags.empty?
+      parts = Util.split_ws(flags)
+      parts.each do |p|
+        token = p.to_s
+        return true if token == "s" || token == "-s" || token == "--silent" || token == "--quiet"
+        if token.start_with?("-") && !token.start_with?("--")
+          chars = token[1..-1].to_s
+          return true if chars.index("s")
+          next
+        end
+        next unless alpha_token?(token)
+        return true if token.index("s")
+      end
+      false
+    end
+
+    def alpha_token?(token)
+      return false if token.nil? || token.empty?
+      i = 0
+      while i < token.length
+        ch = token[i]
+        code = ch.ord
+        upper = code >= 65 && code <= 90
+        lower = code >= 97 && code <= 122
+        return false unless upper || lower
+        i += 1
+      end
+      true
     end
 
     def var_value(vars, name)

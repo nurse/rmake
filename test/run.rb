@@ -1123,6 +1123,76 @@ all:
   end
 end
 
+tests << lambda do
+  opts, _jobs_set = RMake::CLI.parse_args(["-fR", "-", "all"])
+  assert("dash makefile parsed as stdin", opts[:makefiles].include?("-"))
+  assert("dash is not treated as target", !opts[:targets].include?("-"))
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    bye = File.join(dir, "bye.mk")
+    byesrc = File.join(dir, "bye.mk.src")
+    File.write(bye, <<~MK)
+bye.mk: bye.mk.src
+\ttouch $@
+bye.mk.src:
+\ttouch $@
+    MK
+    old = Time.now - 600
+    File.utime(old, old, bye)
+
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        prev = $stdin
+        begin
+          $stdin = StringIO.new("all:; $(info hello, world)\n")
+          status = RMake::CLI.run(["-fbye.mk", "-f-", "all"])
+          assert("stdin makefile remake returns success", status == 0)
+        ensure
+          $stdin = prev
+        end
+      end
+    end
+    combined = out + err
+    assert("stdin makefile info runs after remake", combined.include?("hello, world"))
+    assert("bye source created", File.exist?(byesrc))
+    assert("bye makefile updated", File.mtime(bye) > old)
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    bye = File.join(dir, "bye.mk")
+    File.write(File.join(dir, "base.mk"), "all: ; @echo from-base\n")
+    File.write(bye, <<~MK)
+bye.mk: bye.mk.src
+\ttouch $@
+bye.mk.src:
+\ttouch $@
+    MK
+    old = Time.now - 600
+    File.utime(old, old, bye)
+
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        prev = $stdin
+        begin
+          $stdin = StringIO.new("all:; @echo from-stdin\n")
+          status = RMake::CLI.run(["-f", "base.mk", "-fbye.mk", "-fR", "-", "all"])
+          assert("missing top-level makefile returns failure", status == 2)
+        ensure
+          $stdin = prev
+        end
+      end
+    end
+    combined = out + err
+    assert("missing top-level makefile warning", combined.include?("R: No such file or directory"))
+    assert("missing top-level makefile build error", combined.include?("No rule to make target 'R'"))
+    assert("dash not treated as build target", !combined.include?("No rule to make target '-'"))
+  end
+end
+
 failures = []
 tests.each_with_index do |t, i|
   begin

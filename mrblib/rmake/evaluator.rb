@@ -17,7 +17,7 @@ module RMake
   class Evaluator
     class MakeError < StandardError; end
 
-    Rule = Struct.new(:targets, :prereqs, :order_only, :recipe, :double_colon)
+    Rule = Struct.new(:targets, :prereqs, :order_only, :recipe, :double_colon, :grouped)
 
     attr_reader :rules, :vars, :target_vars, :target_pattern_vars
     attr_reader :target_inherit_append
@@ -113,7 +113,7 @@ module RMake
           files = Util.split_ws(expand(arg))
           files.each do |f|
             @includes << [f, optional]
-            include_file(f, optional)
+            include_file(f, optional, line)
           end
           next
         end
@@ -185,14 +185,14 @@ module RMake
               next if stem.nil?
               prereqs = prereq_words.map { |w| static_replace_percent(w, stem) }.map { |x| Util.normalize_path(Util.normalize_brace_path(x)) }.reject(&:empty?)
               ord = order_words.map { |w| static_replace_percent(w, stem) }.map { |x| Util.normalize_path(Util.normalize_brace_path(x)) }.reject(&:empty?)
-              rule_obj = Rule.new([t], prereqs, ord, [], sep == "::")
+              rule_obj = Rule.new([t], prereqs, ord, [], sep == "::", sep == "&:")
               @rules << rule_obj
               current_rules << rule_obj
             end
           else
             prereqs = prereq_words.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
             order_only = order_words.map { |t| Util.normalize_path(Util.normalize_brace_path(t)) }.reject(&:empty?)
-            rule_obj = Rule.new(targets, prereqs, order_only, [], sep == "::")
+            rule_obj = Rule.new(targets, prereqs, order_only, [], sep == "::", sep == "&:")
             current_rules = [rule_obj]
 
             # Suffix rules like .c.o:
@@ -217,7 +217,11 @@ module RMake
         # Expand standalone function calls (e.g., $(eval ...))
         if s.include?("$")
           expand(s)
+          next
         end
+
+        # Any remaining non-empty line is invalid make syntax.
+        raise make_error(line, "*** missing separator.  Stop.") unless s.to_s.strip.empty?
       end
 
       self
@@ -675,7 +679,7 @@ module RMake
       end
     end
 
-    def include_file(path, optional = false)
+    def include_file(path, optional = false, line = nil)
       return if path.nil? || path.empty?
       candidate = resolve_include_path(path)
       begin
@@ -697,7 +701,13 @@ module RMake
           end
         end
       rescue Errno::ENOENT
-        @missing_required << path unless optional
+        unless optional
+          if line && line.respond_to?(:filename) && line.respond_to?(:lineno)
+            @missing_required << { path: path, file: line.filename.to_s, line: line.lineno.to_i }
+          else
+            @missing_required << { path: path }
+          end
+        end
         return
       end
     end
@@ -971,6 +981,9 @@ module RMake
       return nil if idx.nil?
       if len == 2
         return [s[0...idx], "::", s[(idx + 2)..-1].to_s]
+      end
+      if idx > 0 && s[idx - 1] == "&"
+        return [s[0...(idx - 1)], "&:", s[(idx + 1)..-1].to_s]
       end
       [s[0...idx], ":", s[(idx + 1)..-1].to_s]
     end

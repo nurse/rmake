@@ -1,7 +1,15 @@
 module RMake
   class CLI
+    class ArgError < StandardError; end
+
     def self.run(argv)
       opts, jobs_set = parse_args(argv)
+
+      if opts[:arg_error]
+        msg = "#{make_prefix}: *** #{opts[:arg_error]}.  Stop."
+        emit_error(msg)
+        return 2
+      end
 
       if opts[:help]
         print_help
@@ -17,13 +25,17 @@ module RMake
 
     def self.run_with_opts(opts, jobs_set)
 
-      if opts[:makefile] == "Makefile" && File.exist?("GNUmakefile")
+      if (!opts[:makefiles] || opts[:makefiles].empty?) && opts[:makefile] == "Makefile" && File.exist?("GNUmakefile")
         opts[:makefile] = "GNUmakefile"
       end
 
       make_cmd = make_command
       saved_env = capture_make_env
       set_env_make_vars(make_cmd, opts)
+      top_print_directory = !!opts[:print_directory] && !opts[:silent]
+      if top_print_directory
+        puts "#{make_prefix}: Entering directory '#{Dir.pwd}'"
+      end
 
       begin
         pass = 0
@@ -31,7 +43,9 @@ module RMake
         graph = nil
         remade = {}
         precompleted = {}
+        reported_missing_makefiles = {}
         loop do
+          opts[:_make_restarts] = pass
           begin
             evalr, graph = load_makefile(opts, make_cmd)
           rescue Errno::ENOENT
@@ -45,34 +59,26 @@ module RMake
             else
               msg = "#{make_prefix}: #{opts[:makefile]}: No such file or directory"
             end
-            if Kernel.respond_to?(:warn)
-              warn msg
-            else
-              puts msg
-            end
+            emit_error(msg)
             return 2
           rescue ParseError, Evaluator::MakeError => e
-            if Kernel.respond_to?(:warn)
-              warn e.message
-            else
-              puts e.message
-            end
+            emit_error(e.message)
             return 2
           end
+          remade_makefiles, makefile_error = remake_makefiles(evalr, graph, opts, remade, precompleted, reported_missing_makefiles)
+          return 2 if makefile_error
           rebuilt = remake_includes(evalr, graph, opts, remade, precompleted)
           pass += 1
-          break unless rebuilt && pass < 2
+          break unless (remade_makefiles || rebuilt) && pass < 5
         end
 
         missing = missing_required_includes(evalr, graph, opts)
         if missing.any?
-          missing.each do |path|
-            if Kernel.respond_to?(:warn)
-              warn "rmake: #{path}: No such file or directory"
-            else
-              puts "rmake: #{path}: No such file or directory"
-            end
+          missing.each do |m|
+            emit_error(m[:message])
           end
+          first = missing.first
+          emit_error("#{make_prefix}: *** No rule to make target '#{first[:path]}'.  Stop.") if first && first[:path]
           return 2
         end
 
@@ -82,16 +88,12 @@ module RMake
           targets = [target] if target
         end
         unless targets && !targets.empty?
-          if Kernel.respond_to?(:warn)
-            warn "rmake: no target found"
-          else
-            puts "rmake: no target found"
-          end
+          emit_error("rmake: no target found")
           return 1
         end
 
         shell = Shell.new(opts[:dry_run], opts[:silent], opts[:ignore_errors])
-        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
+        exec = Executor.new(graph, shell, evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if], opts[:always_make])
         begin
           if opts[:question]
             q = 0
@@ -107,16 +109,15 @@ module RMake
             return 2 unless ok
           end
         rescue Evaluator::MakeError => e
-          if Kernel.respond_to?(:warn)
-            warn e.message
-          else
-            puts e.message
-          end
+          emit_error(e.message)
           return 2
         end
         emit_nothing_to_do(targets, opts, graph) if !opts[:trace] && !exec.built_any?
         0
       ensure
+        if top_print_directory
+          puts "#{make_prefix}: Leaving directory '#{Dir.pwd}'"
+        end
         restore_make_env(saved_env)
       end
     end
@@ -133,11 +134,7 @@ module RMake
         end
         reason = chdir_error_reason(e)
         msg = "#{prefix}: *** -C #{dir}: #{reason}. Stop."
-        if Kernel.respond_to?(:warn)
-          warn msg
-        else
-          puts msg
-        end
+        emit_error(msg)
         return 2
       end
       yield
@@ -162,11 +159,51 @@ module RMake
 
     def self.load_makefile(opts, make_cmd)
       lines = []
-      if File.exist?(opts[:makefile])
-        File.open(opts[:makefile], "r") do |io|
-          lines = Parser.new(io, opts[:makefile]).parse
+      files = if opts[:makefiles] && !opts[:makefiles].empty?
+        opts[:makefiles]
+      else
+        [opts[:makefile]]
+      end
+      missing = {}
+      stdin_seen = false
+      files.each do |mf|
+        next if mf.nil? || mf.empty?
+        if mf == "-"
+          if stdin_seen
+            raise Evaluator::MakeError, "#{make_prefix}: *** Makefile from standard input specified twice.  Stop."
+          end
+          stdin_seen = true
+          if opts.key?(:_stdin_makefile_cache)
+            raw = opts[:_stdin_makefile_cache].to_s
+          else
+            raw = read_stdin_makefile
+            opts[:_stdin_makefile_cache] = raw
+          end
+          io = if Object.const_defined?(:StringIO)
+            StringIO.new(raw)
+          else
+            RMake::StringIO.new(raw)
+          end
+          lines.concat(Parser.new(io, "-").parse)
+        else
+          opts[:makefile] = mf
+          if File.exist?(mf)
+            File.open(mf, "r") do |io|
+              lines.concat(Parser.new(io, mf).parse)
+            end
+          else
+            missing[mf] = true
+          end
         end
-      elsif opts[:evals].nil? || opts[:evals].empty?
+      end
+      opts[:_load_files] = files
+      opts[:_missing_makefiles] = missing
+      if lines.empty? && (opts[:evals].nil? || opts[:evals].empty?)
+        if files.length == 1 && (opts[:makefiles].nil? || opts[:makefiles].empty?)
+          opts[:makefile] = files[0]
+        elsif files.length == 1 && files[0] && files[0] != "-"
+          opts[:makefile] = files[0]
+        end
         raise Errno::ENOENT
       end
       begin
@@ -175,6 +212,7 @@ module RMake
         evalr.set_include_dirs(opts[:include_dirs]) if evalr.respond_to?(:set_include_dirs)
         apply_env_vars(evalr, opts)
         set_make_vars(evalr, make_cmd, opts)
+        evalr.set_special_var("MAKEFILE_LIST", makefile_list_value(files), "default")
         evalr.set_no_builtin_rules(true) if opts[:no_builtin_rules]
         evalr.set_no_builtin_variables(true) if opts[:no_builtin_variables]
         apply_cli_assignments(evalr, opts)
@@ -182,7 +220,11 @@ module RMake
         apply_cli_evals(evalr, opts)
         graph = Graph.new
         evalr.rules.each do |r|
-          if r.targets.length > 1
+          if r.targets.any? { |t| t.index("%") }
+            graph.add_pattern_rule(r)
+            next
+          end
+          if r.targets.length > 1 && !r.grouped
             r.targets.each do |t|
               node = graph.ensure_node(t)
               phony = evalr.phony?(t)
@@ -195,7 +237,7 @@ module RMake
               node.target_vars.merge!(tvars) if tvars
               tins = evalr.target_inherit_append[t] if evalr.respond_to?(:target_inherit_append)
               node.target_inherit_append.merge!(tins) if tins && !tins.empty?
-              single = Evaluator::Rule.new([t], r.prereqs, r.order_only, r.recipe, r.double_colon)
+              single = Evaluator::Rule.new([t], r.prereqs, r.order_only, r.recipe, r.double_colon, false)
               graph.add_rule(single, phony: phony, precious: precious)
             end
           else
@@ -222,6 +264,77 @@ module RMake
         end
         return [evalr, graph]
       end
+    end
+
+    def self.read_stdin_makefile
+      begin
+        io = $stdin
+        if io && io.respond_to?(:read)
+          if !io.respond_to?(:tty?) || !io.tty?
+            raw = io.read.to_s
+            return raw unless raw.empty?
+          end
+        end
+      rescue StandardError
+        # fallback to STDIN below
+      end
+      begin
+        io = STDIN
+        if io && io.respond_to?(:read)
+          if !io.respond_to?(:tty?) || !io.tty?
+            return io.read.to_s
+          end
+        end
+      rescue StandardError
+        # ignore and return empty
+      end
+      ""
+    rescue StandardError
+      ""
+    end
+
+    def self.remake_makefiles(evalr, graph, opts, remade, precompleted, reported_missing)
+      files = opts[:_load_files]
+      return [false, false] if files.nil? || files.empty?
+
+      candidates = []
+      seen = {}
+      files.each do |mf|
+        next if mf.nil? || mf.empty? || mf == "-"
+        next if seen[mf]
+        seen[mf] = true
+        candidates << mf
+      end
+      return [false, false] if candidates.empty?
+
+      missing = opts[:_missing_makefiles] || {}
+      candidates.each do |mf|
+        next unless missing[mf]
+        next if reported_missing[mf]
+        msg = "#{make_prefix}: #{mf}: No such file or directory"
+        emit_error(msg)
+        reported_missing[mf] = true
+      end
+
+      exec = Executor.new(graph, Shell.new(opts[:dry_run], opts[:silent]), evalr.vars, evalr.delete_on_error?, opts[:trace], precompleted, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
+      rebuilt = false
+
+      candidates.each do |mf|
+        next if remade[mf]
+        path_missing = missing[mf]
+        if !path_missing && File.exist?(mf) && !exec.needs_build?(mf)
+          remade[mf] = true if remade
+          next
+        end
+
+        ok = exec.build_parallel(mf, opts[:jobs])
+        return [rebuilt, true] unless ok
+        remade[mf] = true if remade
+        mark_precompleted(precompleted, mf) if precompleted
+        rebuilt = true
+      end
+
+      [rebuilt, false]
     end
 
     def self.remake_includes(evalr, graph, opts, remade, precompleted)
@@ -262,12 +375,29 @@ module RMake
       if opts[:dry_run]
         checker = Executor.new(graph, Shell.new(true, opts[:silent]), evalr.vars, evalr.delete_on_error?, false, nil, evalr.suffixes, evalr.second_expansion?, evalr, opts[:touch], opts[:what_if])
       end
-      evalr.missing_required.each do |path|
+      evalr.missing_required.each do |ent|
+        path = nil
+        file = nil
+        line = nil
+        if ent.respond_to?(:[]) && !ent.is_a?(String)
+          path = ent[:path] || ent["path"]
+          file = ent[:file] || ent["file"]
+          line = ent[:line] || ent["line"]
+        else
+          path = ent
+        end
+        path = path.to_s
         next if path.nil? || path.empty?
         if checker && checker.can_build?(path)
           next
         end
-        missing << path unless File.exist?(path)
+        next if File.exist?(path)
+        msg = if file && !file.to_s.empty? && line && line.to_i > 0
+          "#{file}:#{line}: #{path}: No such file or directory"
+        else
+          "rmake: #{path}: No such file or directory"
+        end
+        missing << { path: path, message: msg }
       end
       missing
     end
@@ -290,9 +420,20 @@ module RMake
       puts "  - Variables can be set as VAR=VALUE on the command line"
     end
 
+    def self.emit_error(msg)
+      if Kernel.respond_to?(:warn)
+        warn msg
+      elsif Object.const_defined?(:STDERR) && STDERR.respond_to?(:puts)
+        STDERR.puts(msg)
+      else
+        puts msg
+      end
+    end
+
     def self.parse_args(argv)
       opts = {
         makefile: "Makefile",
+        makefiles: [],
         chdir: nil,
         jobs: 1,
         dry_run: false,
@@ -311,11 +452,13 @@ module RMake
         targets: [],
         evals: [],
         include_dirs: [],
+        include_path_flags: [],
         what_if: [],
         vars: {},
         var_assigns: [],
         trace: false,
         help: false,
+        arg_error: nil,
       }
       jobs_set = false
       silent_set = false
@@ -326,14 +469,34 @@ module RMake
         if arg == "-h" || arg == "--help"
           opts[:help] = true
         elsif arg == "-f"
+          if i + 1 >= argv.length
+            opts[:arg_error] = "option requires an argument -- 'f'"
+            break
+          end
           i += 1
-          opts[:makefile] = argv[i]
+          add_makefile(opts, argv[i].to_s)
+        elsif arg == "--file" || arg == "--makefile"
+          if i + 1 >= argv.length
+            key = arg.start_with?("--file") ? "file" : "makefile"
+            opts[:arg_error] = "option requires an argument -- '#{key}'"
+            break
+          end
+          i += 1
+          add_makefile(opts, argv[i].to_s)
+        elsif arg.start_with?("--file=") || arg.start_with?("--makefile=")
+          key = arg.start_with?("--file=") ? "file" : "makefile"
+          val = arg.split("=", 2)[1].to_s
+          if val.empty?
+            opts[:arg_error] = "option requires an argument -- '#{key}'"
+            break
+          end
+          add_makefile(opts, val)
         elsif arg == "-C"
           i += 1
           opts[:chdir] = argv[i]
         elsif arg == "-j"
           next_arg = argv[i + 1]
-          if next_arg && next_arg.match?(/\A\d+\z/)
+          if next_arg && unsigned_integer_string?(next_arg)
             i += 1
             opts[:jobs] = normalize_jobs(argv[i].to_i)
           else
@@ -383,9 +546,9 @@ module RMake
           opts[:evals] << arg.split("=", 2)[1].to_s
         elsif arg == "-I"
           i += 1
-          opts[:include_dirs] << argv[i].to_s if i < argv.length
+          add_include_dir(opts, argv[i].to_s) if i < argv.length
         elsif arg.start_with?("--include-dir=")
-          opts[:include_dirs] << arg.split("=", 2)[1].to_s
+          add_include_dir(opts, arg.split("=", 2)[1].to_s)
         elsif arg == "-W"
           i += 1
           opts[:what_if] << argv[i].to_s if i < argv.length
@@ -428,6 +591,8 @@ module RMake
           break
         elsif arg == "-d" || arg == "--trace"
           opts[:trace] = true
+        elsif arg == "-"
+          add_makefile(opts, "-")
         elsif !arg.start_with?("-") && (assign = parse_cli_assignment(arg))
           name, op, val = assign
           opts[:var_assigns] << assign
@@ -435,14 +600,20 @@ module RMake
         elsif arg.start_with?("-C") && arg.length > 2
           opts[:chdir] = arg[2..-1]
         elsif arg.start_with?("-j") && arg.length > 2
-          opts[:jobs] = normalize_jobs(arg[2..-1].to_i)
+          v = arg[2..-1].to_s
+          if unsigned_integer_string?(v)
+            opts[:jobs] = normalize_jobs(v.to_i)
+          else
+            opts[:arg_error] = "the '-j' option requires a positive integer argument"
+            break
+          end
           jobs_set = true
         elsif arg.start_with?("-f") && arg.length > 2
-          opts[:makefile] = arg[2..-1]
+          add_makefile(opts, arg[2..-1])
         elsif arg.start_with?("-E") && arg.length > 2
           opts[:evals] << arg[2..-1]
         elsif arg.start_with?("-I") && arg.length > 2
-          opts[:include_dirs] << arg[2..-1]
+          add_include_dir(opts, arg[2..-1])
         elsif arg.start_with?("-W") && arg.length > 2
           opts[:what_if] << arg[2..-1]
         elsif arg.start_with?("-l") && arg.length > 2
@@ -451,6 +622,7 @@ module RMake
           handled, ni, jobs_set = parse_short_bundle(opts, argv, i, jobs_set)
           if handled
             i = ni
+            break if opts[:arg_error]
           else
             opts[:targets] << arg
             opts[:target] = arg
@@ -527,6 +699,16 @@ module RMake
         end
       end
 
+      if opts[:include_path_flags].nil? || opts[:include_path_flags].empty?
+        flags = cli_var_value(opts, "MAKEFLAGS")
+        flags = cli_var_value(opts, "MFLAGS") if flags.nil? || flags.empty?
+        if flags.nil? || flags.empty?
+          flags = env_var("MAKEFLAGS")
+          flags = env_var("MFLAGS") if (flags.nil? || flags.empty?)
+        end
+        parse_include_flags(flags).each { |d| add_include_dir(opts, d) }
+      end
+
       if !jobs_set
         detected = default_jobs
         opts[:jobs] = detected if detected && detected > 0
@@ -537,6 +719,22 @@ module RMake
     def self.short_option_cluster?(flags)
       return false if flags.nil? || flags.empty?
       flags.each_char.all? { |ch| short_option_char?(ch) }
+    end
+
+    def self.add_makefile(opts, path)
+      p = path.to_s
+      opts[:makefiles] << p
+      opts[:makefile] = p
+    end
+
+    def self.add_include_dir(opts, dir)
+      d = dir.to_s
+      opts[:include_path_flags] << d
+      if d == "-"
+        opts[:include_dirs] = []
+      elsif !d.empty?
+        opts[:include_dirs] << d
+      end
     end
 
     def self.short_option_char?(ch)
@@ -585,13 +783,16 @@ module RMake
             i += 1
             rest = argv[i].to_s if i < argv.length
           end
-          return [false, i, jobs_set] if rest.nil? || rest.empty?
+          if rest.nil? || rest.empty?
+            opts[:arg_error] = "option requires an argument -- '#{ch}'"
+            return [true, i, jobs_set]
+          end
           if ch == "f"
-            opts[:makefile] = rest
+            add_makefile(opts, rest)
           elsif ch == "C"
             opts[:chdir] = rest
           elsif ch == "I"
-            opts[:include_dirs] << rest
+            add_include_dir(opts, rest)
           elsif ch == "W"
             opts[:what_if] << rest
           elsif ch == "E"
@@ -609,7 +810,14 @@ module RMake
             end
           end
           if ch == "j"
-            opts[:jobs] = normalize_jobs(rest.to_i)
+            if rest.nil? || rest.empty?
+              opts[:jobs] = normalize_jobs(nil)
+            elsif unsigned_integer_string?(rest)
+              opts[:jobs] = normalize_jobs(rest.to_i)
+            else
+              opts[:arg_error] = "the '-j' option requires a positive integer argument"
+              return [true, i, jobs_set]
+            end
             jobs_set = true
           else
             opts[:load_average] = rest unless rest.nil? || rest.empty?
@@ -624,6 +832,28 @@ module RMake
     def self.normalize_jobs(n)
       return default_jobs if n.nil? || n <= 0
       n
+    end
+
+    def self.makefile_list_value(files)
+      out = []
+      (files || []).each do |f|
+        next if f.nil? || f.empty?
+        out << f
+      end
+      out.join(" ")
+    end
+
+    def self.unsigned_integer_string?(s)
+      return false if s.nil?
+      str = s.to_s
+      return false if str.empty?
+      i = 0
+      while i < str.length
+        c = str.getbyte(i)
+        return false unless c && c >= 48 && c <= 57
+        i += 1
+      end
+      true
     end
 
     def self.make_command
@@ -657,11 +887,16 @@ module RMake
       elsif (ENV["MAKELEVEL"].nil? || ENV["MAKELEVEL"].empty?)
         ENV["MAKELEVEL"] = "0"
       end
+      if opts[:_make_restarts] && opts[:_make_restarts] > 0
+        ENV["MAKE_RESTARTS"] = opts[:_make_restarts].to_s
+      else
+        ENV.delete("MAKE_RESTARTS")
+      end
     end
 
     def self.capture_make_env
       return {} unless Object.const_defined?(:ENV)
-      keys = ["MAKE", "MFLAGS", "MAKEFLAGS", "MAKECMDGOALS", "MAKELEVEL", "__RMAKE_ENV_OVERRIDE__", "__RMAKE_CLI_ASSIGNS_ESC"]
+      keys = ["MAKE", "MFLAGS", "MAKEFLAGS", "MAKECMDGOALS", "MAKELEVEL", "MAKE_RESTARTS", "__RMAKE_ENV_OVERRIDE__", "__RMAKE_CLI_ASSIGNS_ESC"]
       out = {}
       keys.each do |k|
         if ENV.key?(k)
@@ -699,6 +934,10 @@ module RMake
         env_level = env_var("MAKELEVEL")
         level = env_level.to_i if env_level && !env_level.empty?
         evalr.set_special_var("MAKELEVEL", level.to_s, "default")
+      end
+      unless cli_var_assigned?(opts, "MAKE_RESTARTS")
+        restarts = opts[:_make_restarts].to_i
+        evalr.set_special_var("MAKE_RESTARTS", restarts > 0 ? restarts.to_s : "", "default")
       end
     end
 
@@ -880,6 +1119,26 @@ module RMake
       out
     end
 
+    def self.parse_include_flags(flags)
+      out = []
+      return out unless flags && !flags.empty?
+      parts = Util.split_ws(flags)
+      i = 0
+      while i < parts.length
+        p = parts[i].to_s
+        if p == "-I"
+          i += 1
+          out << parts[i].to_s if i < parts.length
+        elsif p == "-I-"
+          out << "-"
+        elsif p.start_with?("-I") && p.length > 2
+          out << p[2..-1].to_s
+        end
+        i += 1
+      end
+      out
+    end
+
     def self.mflags_for(opts)
       flags = []
       flags << "-j#{opts[:jobs]}" if opts[:jobs] > 1
@@ -889,6 +1148,11 @@ module RMake
       flags << "-q" if opts[:question]
       flags << "-r" if opts[:no_builtin_rules]
       flags << "-R" if opts[:no_builtin_variables]
+      include_flags = opts[:include_path_flags] || []
+      include_flags.each do |d|
+        next if d.nil? || d.empty?
+        flags << (d == "-" ? "-I-" : "-I#{d}")
+      end
       flags.join(" ").strip
     end
 
