@@ -295,6 +295,38 @@ end
 
 tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
+    file_path = File.join(dir, "x.out")
+    out_path = File.join(dir, "out.txt")
+    File.write(File.join(dir, "Makefile"), <<~MK)
+      $(file >#{file_path},hello)
+      X := x$(file <#{file_path})y
+      all: ; @echo $(X) > #{out_path}
+    MK
+    Dir.chdir(dir) do
+      status = RMake::CLI.run(["-f", "Makefile", "all"])
+      assert("file function target success", status == 0)
+    end
+    content = File.exist?(out_path) ? File.read(out_path) : ""
+    assert("file function read/write", content.include?("xhelloy"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    File.write(File.join(dir, "Makefile"), "$(file foo)\nall: ; @:\n")
+    out, err = capture_io do
+      Dir.chdir(dir) do
+        status = RMake::CLI.run(["-f", "Makefile", "all"])
+        assert("file invalid op returns failure", status == 2)
+      end
+    end
+    combined = out + err
+    assert("file invalid op message", combined.include?("file: invalid file operation"))
+  end
+end
+
+tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
     sub = File.join(dir, "sub")
     Dir.mkdir(sub)
     out_path = File.join(sub, "out.txt")

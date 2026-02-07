@@ -164,6 +164,12 @@ module RMake
 
     def self.split_func_args(str)
       return ["", ""] if str.nil?
+      left, right, _had_sep = split_func_args_with_flag(str)
+      [left, right]
+    end
+
+    def self.split_func_args_with_flag(str)
+      return ["", "", false] if str.nil?
       i = 0
       closers = []
       while i < str.length
@@ -179,11 +185,11 @@ module RMake
           next
         end
         if closers.empty? && c == ","
-          return [str[0...i].to_s, str[(i + 1)..-1].to_s]
+          return [str[0...i].to_s, str[(i + 1)..-1].to_s, true]
         end
         i += 1
       end
-      [str.to_s, ""]
+      [str.to_s, "", false]
     end
 
     def self.split_func_args_all(str)
@@ -256,6 +262,57 @@ module RMake
         out, status = shell_capture_with_status(cmd, vars, ctx)
         set_shellstatus(vars, ctx, status)
         return out
+      when "file"
+        lhs, rhs, has_sep = split_func_args_with_flag(args)
+        spec = expand(lhs.to_s, vars, ctx).to_s
+        spec = strip_leading_ws(spec)
+        mode = nil
+        path = nil
+        if spec.start_with?(">>")
+          mode = :append
+          path = spec[2..-1].to_s
+        elsif spec.start_with?(">")
+          mode = :write
+          path = spec[1..-1].to_s
+        elsif spec.start_with?("<")
+          mode = :read
+          path = spec[1..-1].to_s
+        else
+          op = split_ws(spec).first.to_s
+          op = spec.to_s if op.empty?
+          raise_make_error("file: invalid file operation: #{op}", ctx)
+        end
+        path = path.to_s.strip
+        raise_make_error("file: missing filename", ctx) if path.empty?
+        if mode == :read
+          raise_make_error("file: too many arguments", ctx) if has_sep
+          return "" unless File.exist?(path)
+          begin
+            data = File.read(path).to_s
+          rescue SystemCallError => e
+            raise_make_error("open: #{path}: #{sys_message(e)}", ctx)
+          rescue StandardError => e
+            raise_make_error("open: #{path}: #{e.message}", ctx)
+          end
+          data = data[0...-1] if data.end_with?("\n")
+          return data
+        end
+        text = nil
+        if has_sep
+          text = expand(rhs.to_s, vars, ctx).to_s
+          text += "\n" unless text.end_with?("\n")
+        end
+        open_mode = (mode == :append ? "a" : "w")
+        begin
+          File.open(path, open_mode) do |f|
+            f.write(text) unless text.nil?
+          end
+        rescue SystemCallError => e
+          raise_make_error("open: #{path}: #{sys_message(e)}", ctx)
+        rescue StandardError => e
+          raise_make_error("open: #{path}: #{e.message}", ctx)
+        end
+        return ""
       when "if"
         a, rest = split_func_args(args)
         b, c = split_func_args(rest)
@@ -692,6 +749,18 @@ module RMake
       return false if pattern.nil?
       tokens = parse_pattern_tokens(pattern.to_s)
       match_pattern_tokens(word.to_s, tokens, 0, 0)
+    end
+
+    def self.sys_message(error)
+      errnum = if error.class.const_defined?(:Errno)
+        error.class.const_get(:Errno)
+      else
+        nil
+      end
+      return error.message.to_s if errnum.nil?
+      SystemCallError.new(nil, errnum).message
+    rescue StandardError
+      error.message.to_s
     end
 
     def self.parse_pattern_tokens(pattern)
