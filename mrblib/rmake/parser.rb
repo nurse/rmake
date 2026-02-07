@@ -15,6 +15,7 @@ module RMake
       continuing = false
       continuation_recipe = false
       posix_mode = false
+      recipe_prefix = "\t"
       in_define = false
       define_name = nil
       define_op = "="
@@ -64,7 +65,10 @@ module RMake
             next
           end
         end
-        is_recipe = continuing ? continuation_recipe : line.start_with?("\t")
+        is_recipe = continuing ? continuation_recipe : (!recipe_prefix.empty? && line.start_with?(recipe_prefix))
+        if is_recipe && !continuing
+          line = line[recipe_prefix.length..-1].to_s
+        end
         if line.end_with?("\\")
           chunk = line[0...-1]
           if !is_recipe && !posix_mode && chunk.end_with?("$")
@@ -84,6 +88,10 @@ module RMake
         end
         stripped = is_recipe ? buf : Util.strip_comments(buf)
         lines << Line.new(buf, stripped, is_recipe, idx, @filename)
+        if !is_recipe
+          new_prefix = recipe_prefix_from_assignment(stripped)
+          recipe_prefix = new_prefix unless new_prefix.nil?
+        end
         if !is_recipe && stripped.to_s.strip.start_with?(".POSIX:")
           posix_mode = true
         end
@@ -188,6 +196,16 @@ module RMake
       else
         puts text
       end
+    end
+
+    def recipe_prefix_from_assignment(stripped)
+      s = stripped.to_s.strip
+      return nil unless s.start_with?(".RECIPEPREFIX")
+      eq = s.index("=")
+      return nil if eq.nil?
+      rhs = Util.strip_leading_ws(s[(eq + 1)..-1].to_s)
+      return "\t" if rhs.empty?
+      rhs[0]
     end
 
   end

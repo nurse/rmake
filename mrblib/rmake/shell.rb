@@ -1,9 +1,12 @@
 module RMake
   class Shell
+    attr_reader :last_error
+
     def initialize(dry_run = false, silent = false, ignore_errors = false)
       @dry_run = dry_run
       @silent = silent
       @ignore_errors = ignore_errors
+      @last_error = nil
     end
 
     def dry_run?
@@ -15,6 +18,7 @@ module RMake
     end
 
     def run(cmd, vars, env_vars = nil)
+      @last_error = nil
       env_vars ||= {}
       loc_file, loc_line, raw_cmd = Util.extract_location(cmd.to_s)
       expand_ctx = env_vars.dup
@@ -56,6 +60,12 @@ module RMake
           puts "#{recursive_make_prefix(vars)}: Leaving directory '#{Dir.pwd}'"
         end
         unless ok
+          @last_error = {
+            status: status || 1,
+            line_cmd: line_cmd,
+            file: expand_ctx["__file"],
+            line: expand_ctx["__line"],
+          }
           if ignore_fail
             emit_ignored_error(expand_ctx, status, vars)
             ran = true
@@ -69,6 +79,7 @@ module RMake
     end
 
     def run_recipe(recipe, vars, env_vars = nil)
+      @last_error = nil
       env_vars ||= {}
       prepared = []
       recipe.each do |raw|
@@ -117,6 +128,12 @@ module RMake
           puts "#{recursive_make_prefix(vars)}: Leaving directory '#{Dir.pwd}'"
         end
         unless ok
+          @last_error = {
+            status: status || 1,
+            line_cmd: line_cmd,
+            file: expand_ctx["__file"],
+            line: expand_ctx["__line"],
+          }
           if ignore_fail
             emit_ignored_error(expand_ctx, status, vars)
             ran = true

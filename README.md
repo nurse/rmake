@@ -41,6 +41,7 @@ Options:
 - `-f FILE` Read FILE as a makefile
 - `-j N`    Run N jobs in parallel
 - `-n`      Dry-run (print commands without running)
+- `-q`      Question mode (exit 0/1/2 without running recipes)
 - `-d`      Trace target evaluation and skips
 
 ## Status
@@ -71,7 +72,18 @@ Options:
 
 ```sh
 ruby test/run.rb
+ruby test/run_gnumake_compat.rb
 ```
+
+`test/run_gnumake_compat.rb` downloads GNU make's `run_make_tests.pl` at runtime
+(default URLs:
+`https://cgit.git.savannah.gnu.org/cgit/make.git/plain/tests/run_make_tests.pl`,
+`https://raw.githubusercontent.com/mirror/make/master/tests/run_make_tests.pl`).
+If `tmp/run_make_tests.pl` exists, it is used as-is and no download is attempted.
+Set `RUN_MAKE_TESTS_FETCH=0` to forbid downloads (missing local file then fails).
+
+`tmp/` and `work/` are scratch directories. They are intentionally ignored by git
+and can be removed at any time.
 
 ## Next
 

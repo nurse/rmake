@@ -6,3 +6,5 @@ mruby/bin/
 
 # rmake temporary files
 *.tmp
+tmp/
+work/
