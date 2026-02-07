@@ -236,10 +236,10 @@ module RMake
       names.each do |name|
         next if name.nil? || name.empty?
         val = var_value(vars, name)
-        if (val.nil? || val.empty?) && Object.const_defined?(:ENV)
+        if val.nil? && Object.const_defined?(:ENV)
           val = ENV[name]
         end
-        next if val.nil?
+        val = "" if val.nil?
         assigns << "#{name}=#{Util.shell_escape(val.to_s)}"
       end
       return cmd if assigns.empty?

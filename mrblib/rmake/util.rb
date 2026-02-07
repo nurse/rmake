@@ -2,7 +2,7 @@ module RMake
   module Util
     def self.strip_comments(line)
       # Remove comments unless escaped. This is a minimal placeholder.
-      return line.rstrip if line.index("#").nil?
+      return line if line.index("#").nil?
       in_escape = false
       out = ""
       line.each_char do |ch|
@@ -12,7 +12,7 @@ module RMake
         in_escape = (ch == "\\") && !in_escape
         out << ch
       end
-      out.rstrip
+      out
     end
 
     def self.expand(str, vars, ctx = {})
@@ -57,7 +57,7 @@ module RMake
                 out << (ctx[auto] || "")
               else
                 var = vars[auto]
-                out << (var ? (var.simple ? var.value : expand(var.value, vars, ctx)) : "")
+                out << (var ? expand_var(var, vars, ctx) : "")
               end
               i += 2
               next
@@ -88,22 +88,7 @@ module RMake
       value = ctx[name]
       if value.nil?
         var = vars[name]
-        if var
-          if var.simple
-            value = var.value
-          else
-            ctx2 = ctx ? ctx.dup : {}
-            if var.respond_to?(:file) && var.file && !var.file.to_s.empty?
-              ctx2["__def_file"] = var.file
-            end
-            if var.respond_to?(:line) && var.line && !var.line.to_s.empty?
-              ctx2["__def_line"] = var.line
-            end
-            value = expand(var.value, vars, ctx2)
-          end
-        else
-          value = ""
-        end
+        value = var ? expand_var(var, vars, ctx) : ""
         if var.nil?
           envv = env_value(name)
           value = envv unless envv.nil?
@@ -158,22 +143,20 @@ module RMake
     def self.split_func_args(str)
       return ["", ""] if str.nil?
       i = 0
-      depth = 0
-      closer = nil
+      closers = []
       while i < str.length
         c = str[i]
         if c == "$" && (str[i + 1] == "(" || str[i + 1] == "{")
-          depth += 1
-          closer = str[i + 1] == "(" ? ")" : "}"
+          closers << (str[i + 1] == "(" ? ")" : "}")
           i += 2
           next
         end
-        if depth > 0 && c == closer
-          depth -= 1
+        if !closers.empty? && c == closers[-1]
+          closers.pop
           i += 1
           next
         end
-        if depth == 0 && c == ","
+        if closers.empty? && c == ","
           return [str[0...i].to_s, str[(i + 1)..-1].to_s]
         end
         i += 1
@@ -186,26 +169,24 @@ module RMake
       out = []
       cur = ""
       i = 0
-      depth = 0
-      closer = nil
+      closers = []
       while i < str.length
         c = str[i]
         if c == "$" && (str[i + 1] == "(" || str[i + 1] == "{")
-          depth += 1
-          closer = str[i + 1] == "(" ? ")" : "}"
+          closers << (str[i + 1] == "(" ? ")" : "}")
           cur << c
           i += 1
           cur << str[i]
           i += 1
           next
         end
-        if depth > 0 && c == closer
-          depth -= 1
+        if !closers.empty? && c == closers[-1]
+          closers.pop
           cur << c
           i += 1
           next
         end
-        if depth == 0 && c == ","
+        if closers.empty? && c == ","
           out << cur
           cur = ""
           i += 1
@@ -250,9 +231,10 @@ module RMake
         cmd = with_exported_env(cmd, vars, ctx)
         return shell_capture(cmd)
       when "if"
-        a, b, c = split_func_args_all(args)
+        a, rest = split_func_args(args)
+        b, c = split_func_args(rest)
         cond = expand(a.to_s, vars, ctx)
-        return cond.to_s.empty? ? expand(c.to_s, vars, ctx) : expand(b.to_s, vars, ctx)
+        return strip_ws(cond.to_s).empty? ? expand(c.to_s, vars, ctx) : expand(b.to_s, vars, ctx)
       when "and"
         parts = split_func_args_all(args)
         out = ""
@@ -414,17 +396,30 @@ module RMake
         parts = split_func_args_all(args)
         name = expand(parts.shift.to_s, vars, ctx)
         var = vars[name]
-        body = var ? var.value.to_s : ""
         ctx2 = ctx.dup
+        ctx2.keys.each do |k|
+          next unless digits_only?(k.to_s) || k.to_s == "0"
+          ctx2.delete(k)
+        end
         ctx2["0"] = name
         parts.each_with_index do |arg, i|
           ctx2[(i + 1).to_s] = expand(arg.to_s, vars, ctx)
         end
+        if var.nil?
+          call_args = parts.map { |arg| expand(arg.to_s, vars, ctx) }
+          res = eval_func(name.to_s, call_args.join(","), vars, ctx2)
+          return res.nil? ? "" : res
+        end
+        body = var.value.to_s
         return expand(body, vars, ctx2)
       when "foreach"
-        a, b = split_func_args(args)
-        var_name = expand(a.to_s, vars, ctx)
-        list, text = split_func_args(b)
+        parts = split_func_args_all(args)
+        if parts.length < 3
+          raise_make_error("insufficient number of arguments (#{parts.length}) to function 'foreach'", ctx, true)
+        end
+        var_name = expand(parts[0].to_s, vars, ctx).to_s.strip
+        list = parts[1]
+        text = parts[2..-1].join(",")
         words = split_ws(expand(list.to_s, vars, ctx))
         out = []
         words.each do |w|
@@ -435,9 +430,14 @@ module RMake
         return out.join(" ")
       when "eval"
         eval_body = expand(args.to_s, vars, ctx)
+        if ctx && ctx["@"]
+          if contains_prereq_rule?(eval_body)
+            raise_make_error("prerequisites cannot be defined in recipes", ctx)
+          end
+        end
         evaluator = ctx["__evaluator"]
         if evaluator && evaluator.respond_to?(:eval_text, true)
-          evaluator.send(:eval_text, eval_body.to_s)
+          evaluator.send(:eval_text, eval_body.to_s, ctx)
         end
         return ""
       when "warning"
@@ -459,6 +459,38 @@ module RMake
     def self.truthy_value?(value)
       return false if value.nil?
       !strip_ws(value.to_s).empty?
+    end
+
+    def self.contains_prereq_rule?(text)
+      lines = text.to_s.split("\n", -1)
+      lines.each do |line|
+        s = line.to_s.strip
+        next if s.empty?
+        next if s[0] == "#"
+        idx = s.index(":")
+        next if idx.nil?
+        op = s[idx, 4].to_s
+        next if op.start_with?(":=", "::=", ":::=")
+        next if idx > 0 && (s[idx - 1] == "?" || s[idx - 1] == "+")
+        rhs = s[(idx + 1)..-1].to_s.strip
+        next if rhs.empty?
+        rhs = rhs.split(";", 2)[0].to_s.strip
+        return true unless rhs.empty?
+      end
+      false
+    end
+
+    def self.expand_var(var, vars, ctx)
+      return "" if var.nil?
+      return var.value if var.simple
+      ctx2 = ctx ? ctx.dup : {}
+      if var.respond_to?(:file) && var.file && !var.file.to_s.empty?
+        ctx2["__def_file"] = var.file
+      end
+      if var.respond_to?(:line) && var.line && !var.line.to_s.empty?
+        ctx2["__def_line"] = var.line
+      end
+      expand(var.value, vars, ctx2)
     end
 
     def self.with_location_prefix(msg, ctx, prefer_definition = false)

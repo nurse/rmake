@@ -642,12 +642,19 @@ module RMake
       end
     end
 
-    def eval_text(text)
+    def eval_text(text, call_ctx = nil)
       return if text.nil? || text.empty?
       io = StringIO.new(text)
       extra = Parser.new(io, "<eval>").parse
       Evaluator.new(extra).tap do |ev|
         ev.vars.merge!(@vars)
+        if call_ctx
+          call_ctx.each do |k, v|
+            next if k.nil? || k.empty?
+            next if k.start_with?("__")
+            ev.vars[k] = Var.simple(v.to_s)
+          end
+        end
         if ev.instance_variable_defined?(:@origins)
           ev.instance_variable_get(:@origins).merge!(@origins)
         end
