@@ -23,6 +23,10 @@ MRuby::Build.new("host") do |conf|
   conf.gem core: "mruby-io"
   conf.gem core: "mruby-time"
   conf.gem core: "mruby-dir"
-  conf.gem gemdir: "#{__dir__}/../mruby/mrbgems/mruby-process"
+  # mruby-process depends on POSIX headers (e.g. sys/wait.h) and does not
+  # build on Windows runners.
+  unless RUBY_PLATFORM =~ /mswin|mingw|cygwin/
+    conf.gem gemdir: "#{__dir__}/../mruby/mrbgems/mruby-process"
+  end
   conf.gem gemdir: "#{__dir__}/../mruby/mrbgems/mruby-file-stat"
 end
