@@ -227,6 +227,17 @@ tests << lambda do
 end
 
 tests << lambda do
+  ev = parse_eval(<<~MK)
+    bundled-gems-rev := net-imap|0.6.2|rev123|https://example/repo
+    foreach-bundled-gems-rev = $(foreach g,$(bundled-gems-rev),$(call foreach-bundled-gems-rev-0,$(1),$(subst |, ,$(value g))))
+    foreach-bundled-gems-rev-0 = $(call $(1),$(word 1,$(2)),$(word 2,$(2)),$(word 3,$(2)),$(word 4,$(2)))
+    bundled-gem-gemspec = gems/src/$(1)/$(1).gemspec
+  MK
+  out = RMake::Util.expand("$(call foreach-bundled-gems-rev,bundled-gem-gemspec)", ev.vars)
+  assert("value() sees foreach variable from context", out == "gems/src/net-imap/net-imap.gemspec")
+end
+
+tests << lambda do
   Dir.mktmpdir("rmake-test-") do |dir|
     bin = File.join(dir, "bin")
     FileUtils.mkdir_p(bin)

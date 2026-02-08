@@ -477,6 +477,9 @@ module RMake
         return words.uniq.sort.join(" ")
       when "value"
         name = expand(args.to_s, vars, ctx)
+        if ctx && ctx.key?(name)
+          return (ctx[name] || "").to_s
+        end
         var = vars[name]
         return var ? var.value.to_s : ""
       when "flavor"
