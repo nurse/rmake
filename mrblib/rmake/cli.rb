@@ -909,12 +909,53 @@ module RMake
         env_make = Util.shell_capture("printenv MAKE")
         return env_make if env_make && !env_make.empty?
       end
-      make_path = File.expand_path($0)
+      make_path = resolve_program_path($0)
       mruby_path = nil
       if $rmake_mruby && File.exist?($rmake_mruby)
         mruby_path = $rmake_mruby
       end
       mruby_path ? "#{mruby_path} #{make_path}" : make_path
+    end
+
+    def self.resolve_program_path(prog)
+      prog_name = prog.to_s
+      return prog_name if prog_name.empty?
+
+      if explicit_program_path?(prog_name)
+        return File.expand_path(prog_name)
+      end
+
+      path_env = env_var("PATH")
+      if path_env && !path_env.empty?
+        sep = File::PATH_SEPARATOR
+        exts = executable_extensions
+        path_env.split(sep).each do |dir|
+          next if dir.nil? || dir.empty?
+          exts.each do |ext|
+            cand = File.join(dir, prog_name + ext)
+            return File.expand_path(cand) if File.exist?(cand)
+          end
+        end
+      end
+
+      prog_name
+    end
+
+    def self.explicit_program_path?(prog)
+      return true if prog.include?("/") || prog.include?("\\")
+      prog.length >= 2 && prog[1] == ":" # drive letter (C:)
+    end
+
+    def self.executable_extensions
+      pathext = env_var("PATHEXT")
+      return [""] if pathext.nil? || pathext.empty?
+      out = [""]
+      pathext.split(";").each do |e|
+        next if e.nil? || e.empty?
+        ext = e.start_with?(".") ? e.downcase : ".#{e.downcase}"
+        out << ext
+      end
+      out
     end
 
     def self.set_env_make_vars(make_cmd, opts)

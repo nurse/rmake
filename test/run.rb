@@ -227,6 +227,35 @@ tests << lambda do
 end
 
 tests << lambda do
+  Dir.mktmpdir("rmake-test-") do |dir|
+    bin = File.join(dir, "bin")
+    FileUtils.mkdir_p(bin)
+    exe = File.join(bin, "rmake")
+    File.write(exe, "#!/bin/sh\nexit 0\n")
+    File.chmod(0755, exe)
+
+    prev0 = $0
+    prev_make = ENV["MAKE"]
+    prev_path = ENV["PATH"]
+    begin
+      $0 = "rmake"
+      ENV.delete("MAKE")
+      ENV["PATH"] = [bin, prev_path].join(File::PATH_SEPARATOR)
+      cmd = RMake::CLI.make_command
+      assert("make_command resolves PATH basename to absolute path", cmd == File.expand_path(exe))
+    ensure
+      $0 = prev0
+      if prev_make
+        ENV["MAKE"] = prev_make
+      else
+        ENV.delete("MAKE")
+      end
+      ENV["PATH"] = prev_path
+    end
+  end
+end
+
+tests << lambda do
   src = "FOO := $(shell echo '#') # tail"
   got = RMake::Util.strip_comments(src)
   assert("strip_comments keeps # inside function args", got.include?("echo '#'"))
