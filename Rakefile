@@ -85,6 +85,16 @@ def download_actions_artifacts(run_id)
   [tmp, files]
 end
 
+def assert_actions_artifact_files!(files)
+  root_dist = File.expand_path(File.join(ROOT, "dist")) + File::SEPARATOR
+  files.each do |path|
+    expanded = File.expand_path(path)
+    if expanded.start_with?(root_dist)
+      abort("refusing to upload local dist artifact: #{expanded}")
+    end
+  end
+end
+
 namespace :test do
   desc "Run local regression tests (test/run.rb)"
   task :unit do
@@ -159,8 +169,8 @@ desc "Build standalone rmake binary"
 task build: "build:rmake"
 
 namespace :release do
-  desc "Create next patch release from current working tree and attach Actions artifacts"
-  task :publish do
+  desc "Create next patch release and upload only GitHub Actions artifacts"
+  task :from_actions do
     status = `git status --porcelain`.strip
     abort("working tree is clean; nothing to release") if status.empty?
 
@@ -176,15 +186,19 @@ namespace :release do
     run_id = wait_for_actions_run(tag)
     tmp, files = download_actions_artifacts(run_id)
     begin
+      assert_actions_artifact_files!(files)
       run_cmd("gh", "release", "create", tag, "--generate-notes", "--title", tag)
       run_cmd("gh", "release", "upload", tag, *files, "--clobber")
     ensure
       FileUtils.rm_rf(tmp)
     end
   end
+
+  desc "Alias of release:from_actions"
+  task publish: :from_actions
 end
 
-desc "Commit, tag, push, and create GitHub Release with Actions artifacts"
-task release: "release:publish"
+desc "Commit, tag, push, and create GitHub Release (Actions artifacts only)"
+task release: "release:from_actions"
 
 task default: :test
